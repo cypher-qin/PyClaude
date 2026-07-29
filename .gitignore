@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# runtime state
+.memory/
+.transcripts/
+.tasks/
+.mailboxes/
+.task_outputs/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
