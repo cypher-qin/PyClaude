@@ -28,6 +28,7 @@ myagent — 个人编码 Agent（基于 learn-claude-code 提炼）
 import ast
 import json
 import os
+import platform
 import random
 import subprocess
 import time
@@ -98,19 +99,34 @@ PROMPT = "\033[36mmyagent >> \033[0m"
 #  基础工具（给模型的「手」）
 # ═══════════════════════════════════════════════════════════════════════════
 
-def safe_path(p: str) -> Path:
-    """文件类工具限制在工作目录内；bash 不受此限，交给 permission hook 管控。"""
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+def resolve_path(p: str) -> Path:
+    """解析为绝对路径（相对路径相对工作目录）；不在此处做范围限制。"""
+    return (WORKDIR / p).resolve()
+
+
+def is_inside_workspace(path: Path) -> bool:
+    """路径是否在工作目录内。工作区外的写/改会走 permission_hook 的用户审核。"""
+    return path.is_relative_to(WORKDIR)
+
+
+def _decode_console(raw: bytes) -> str:
+    """中文 Windows 上命令输出编码不统一：先按 UTF-8，失败回退 GBK，最后兜底替换。"""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def run_bash(command: str) -> str:
+    # 注意：capture_output 拿字节再手动解码，避免 text=True 在中文 Windows 用 GBK
+    # 解码非 GBK 输出时崩溃（会让 stdout 变 None 触发 None+str）。
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, timeout=120)
+        raw = (r.stdout or b"") + (r.stderr or b"")
+        out = _decode_console(raw).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
@@ -120,7 +136,7 @@ def run_bash(command: str) -> str:
 
 def run_read(path: str, limit: int | None = None, offset: int = 0) -> str:
     try:
-        lines = safe_path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = resolve_path(path).read_text(encoding="utf-8", errors="replace").splitlines()
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -133,7 +149,7 @@ def run_read(path: str, limit: int | None = None, offset: int = 0) -> str:
 
 def run_write(path: str, content: str) -> str:
     try:
-        fp = safe_path(path)
+        fp = resolve_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
@@ -143,7 +159,7 @@ def run_write(path: str, content: str) -> str:
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        fp = safe_path(path)
+        fp = resolve_path(path)
         text = fp.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
@@ -156,22 +172,25 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 def run_glob(pattern: str) -> str:
     import glob as g
     try:
-        results = [m for m in g.glob(pattern, root_dir=WORKDIR)
-                   if (WORKDIR / m).resolve().is_relative_to(WORKDIR)]
+        # 绝对模式直接匹配；相对模式相对工作目录。读类工具不再限制在工作区内。
+        if os.path.isabs(pattern):
+            results = g.glob(pattern, recursive=True)
+        else:
+            results = g.glob(pattern, root_dir=WORKDIR, recursive=True)
         return "\n".join(results) if results else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
 
 
 def run_grep(pattern: str, path: str = ".", glob: str = "*") -> str:
-    """在工作目录内递归搜索（纯 Python，跨平台，不依赖 rg/grep）。"""
+    """递归正则搜索（纯 Python，跨平台）。path 可为整机任意路径。"""
     import fnmatch
     import re
     try:
         regex = re.compile(pattern)
     except re.error as e:
         return f"Error: bad regex: {e}"
-    base = safe_path(path)
+    base = resolve_path(path)
     hits = []
     files = [base] if base.is_file() else base.rglob("*")
     for fp in files:
@@ -181,7 +200,10 @@ def run_grep(pattern: str, path: str = ".", glob: str = "*") -> str:
             for i, line in enumerate(fp.read_text(encoding="utf-8",
                                                   errors="replace").splitlines(), 1):
                 if regex.search(line):
-                    rel = fp.relative_to(WORKDIR)
+                    try:
+                        rel = fp.relative_to(WORKDIR)
+                    except ValueError:
+                        rel = fp
                     hits.append(f"{rel}:{i}:{line.strip()[:200]}")
                     if len(hits) >= 200:
                         return "\n".join(hits) + "\n... (truncated at 200 hits)"
@@ -312,6 +334,16 @@ def assemble_system_prompt() -> str:
         "Skills catalog:\n" + list_skills()
         + "\nUse load_skill(name) to expand a skill when it is relevant.",
     ]
+    sections.append(
+        "File tools: read_file / glob / grep can access ANY path on the machine. "
+        "write_file / edit_file default to the working directory; writing OUTSIDE "
+        "it is allowed but will PAUSE for the user's confirmation — so only do it "
+        "when the user clearly wants a file changed outside this project.")
+    if os.name == "nt":
+        sections.append(
+            "Platform: Windows. The `bash` tool runs via cmd.exe, NOT a Unix shell — "
+            "use dir / type / findstr or `powershell -Command ...`, never cat/ls/grep. "
+            "Prefer the dedicated file tools over the shell for file work.")
     memories = read_memory()
     if memories:
         sections.append(f"Relevant memories:\n{memories}")
@@ -341,6 +373,34 @@ DESTRUCTIVE = ["rm ", "rmdir", "del ", "format ", "> /etc/", "chmod 777",
                "git push", "git reset --hard"]
 
 
+def confirm_out_of_workspace_write(tool_name: str, target: Path, args: dict) -> bool:
+    """工作区外的写/改：展示改动预览并请用户当场批准。批准返回 True。"""
+    action = "写入(覆盖)" if tool_name == "write_file" else "修改"
+    bar = "\033[33m│\033[0m"
+    print(f"\n\033[33m╭─ 审核请求：Agent 想{action}『工作区外』的文件\033[0m")
+    print(f"{bar}  路径  {target}")
+    if tool_name == "write_file":
+        content = str(args.get("content", ""))
+        state = "已存在，将被覆盖" if target.exists() else "新建文件"
+        print(f"{bar}  目标  {state} · {len(content)} 字符")
+        preview = content[:200]
+        if preview:
+            indented = preview.replace("\n", f"\n{bar}        ")
+            print(f"{bar}  预览  {indented}")
+    else:
+        old = str(args.get("old_text", ""))
+        new = str(args.get("new_text", ""))
+        print(f"{bar}  \033[31m- {old[:120]!r}\033[0m")
+        print(f"{bar}  \033[32m+ {new[:120]!r}\033[0m")
+    print("\033[33m╰─\033[0m", end="")
+    try:
+        answer = input(" 允许? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
 def permission_hook(block):
     """在工具真正执行前拦截：黑名单直接拒绝，危险操作弹确认。"""
     if block.name == "bash":
@@ -353,10 +413,16 @@ def permission_hook(block):
             if input("  允许执行? [y/N] ").strip().lower() not in ("y", "yes"):
                 return "Permission denied by user"
     if block.name in ("write_file", "edit_file"):
+        raw = block.input.get("path", "")
         try:
-            safe_path(block.input.get("path", ""))
-        except Exception:
-            return f"Permission denied: path escapes workspace: {block.input.get('path')}"
+            target = resolve_path(raw)
+        except Exception as e:
+            return f"Permission denied: invalid path {raw!r}: {e}"
+        # 工作区内直接放行；工作区外的写/改需要用户当场审核
+        if not is_inside_workspace(target):
+            if not confirm_out_of_workspace_write(block.name, target, block.input):
+                return ("Permission denied by user: refused to modify "
+                        f"out-of-workspace file {target}")
     return None
 
 
@@ -762,15 +828,55 @@ def agent_loop(messages: list):
 # ═══════════════════════════════════════════════════════════════════════════
 #  入口 —— 交互式 REPL
 # ═══════════════════════════════════════════════════════════════════════════
+LOGO = r"""
+        █████████╗  ██╗ ██████╗
+        ╚══██╔═══╝  ██║██╔═══██╗
+           ██║      ██║██║   ██║
+           ██║      ██║██║   ██║
+           ██║      ██║╚██████╔╝
+           ╚═╝      ╚═╝ ╚═════╝
+
+              T10 AGENT
+"""
+
+def _os_label() -> str:
+    # platform.release() 在 Win11 上会误报 "10"，用 build 号(>=22000 即 Win11)纠正
+    if platform.system() == "Windows":
+        try:
+            build = int(platform.version().split(".")[-1])
+            return "Windows 11" if build >= 22000 else "Windows 10"
+        except (ValueError, IndexError):
+            return f"Windows {platform.release()}"
+    return f"{platform.system()} {platform.release()}"
+
+
+def print_banner():
+    now = datetime.now()
+    week = "一二三四五六日"[now.weekday()]
+    endpoint = os.getenv("ANTHROPIC_BASE_URL") or "api.anthropic.com (官方)"
+    model_line = MODEL + (f"  · fallback: {FALLBACK_MODEL}" if FALLBACK_MODEL else "")
+    rows = [
+        ("时间", f"{now:%Y-%m-%d %H:%M:%S}  周{week}"),
+        ("模型", model_line),
+        ("端点", endpoint),
+        ("目录", str(WORKDIR)),
+        ("环境", f"{_os_label()} · Python {platform.python_version()}"),
+        ("能力", f"{len(BUILTIN_TOOLS)} tools · {len(SKILL_REGISTRY)} skills"),
+    ]
+    print(f"\033[1;36m{LOGO}\033[0m")
+    for label, value in rows:
+        print(f"  \033[1;36m{label}\033[0m  \033[37m{value}\033[0m")
+    print(f"\n  \033[90m回车发送 · q 退出 · 让我 compact 可压缩上下文 · "
+          f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认\033[0m\n")
+
+
 if __name__ == "__main__":
-    print(f"\033[1mmyagent\033[0m  ({MODEL} @ {os.getenv('ANTHROPIC_BASE_URL') or 'api.anthropic.com'})")
-    print(f"工作目录: {WORKDIR}")
-    print("输入任务，回车发送。输入 q 退出。\n")
+    print_banner()
 
     history: list = []
     while True:
         try:
-            query = input(PROMPT)
+            query = input(f"\033[36m[{datetime.now():%H:%M}] myagent >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", "quit", ""):
