@@ -55,6 +55,9 @@ import yaml
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# MCP 集成（两条实现路径由 .env 的 MCP_MODE 切换；具体 client 是懒加载的）
+from mcp_integration import connect_mcp_servers, shutdown_mcp_servers
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
 #
@@ -65,7 +68,12 @@ from dotenv import load_dotenv
 #      MODEL_ID=<在 Kimi 控制台确认的模型 id>
 #  代码本身一行都不用动。SDK 会自动从环境变量读取 ANTHROPIC_API_KEY。
 # ═══════════════════════════════════════════════════════════════════════════
+# .env 优先于外部环境变量（override=True），避免 shell 里的旧 key 悄悄生效。
+# 例外：MCP 开关允许命令行临时覆盖，方便 `MCP_MODE=sdk python agent.py` 这样 A/B 对比。
+_CLI_OVERRIDES = {k: v for k, v in os.environ.items()
+                  if k.startswith("MCP_")}
 load_dotenv(override=True)
+os.environ.update(_CLI_OVERRIDES)
 
 # 用第三方 base_url 时，清掉可能残留的 ANTHROPIC_AUTH_TOKEN，避免鉴权串味
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -334,6 +342,13 @@ def assemble_system_prompt() -> str:
         "Skills catalog:\n" + list_skills()
         + "\nUse load_skill(name) to expand a skill when it is relevant.",
     ]
+    mcp_tools = [t["name"] for t in TOOLS if t["name"].startswith("mcp__")]
+    if mcp_tools:
+        sections.append(
+            "MCP tools: tools named mcp__{server}__{tool} come from external MCP servers "
+            "and are as real as the built-in ones — call them the same way. "
+            f"Available now: {', '.join(mcp_tools)}. "
+            "Prefer them over `bash curl` for the systems they cover.")
     sections.append(
         "File tools: read_file / glob / grep can access ANY path on the machine. "
         "write_file / edit_file default to the working directory; writing OUTSIDE "
@@ -740,6 +755,22 @@ def call_tool_handler(handler, args: dict, name: str) -> str:
         return f"Error: {e}"
 
 
+# ── 工具池装配：内置工具 + MCP 工具 ──
+# MCP 工具在启动时通过 tools/list 动态发现，按 mcp__{server}__{tool} 并进来。
+# 装配后两者对模型、对 agent_loop、对权限钩子完全一视同仁。
+TOOLS: list[dict] = list(BUILTIN_TOOLS)
+HANDLERS: dict = dict(BUILTIN_HANDLERS)
+
+
+def assemble_tool_pool():
+    """连接 MCP server（若 .env 里开了），把发现到的工具并入全局工具池。"""
+    global TOOLS, HANDLERS
+    mcp_tools, mcp_handlers = connect_mcp_servers()
+    TOOLS = list(BUILTIN_TOOLS) + mcp_tools
+    HANDLERS = {**BUILTIN_HANDLERS, **mcp_handlers}
+    return TOOLS, HANDLERS
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Agent Loop —— 全部机制都围着这一个 while 循环转
 # ═══════════════════════════════════════════════════════════════════════════
@@ -748,7 +779,7 @@ def call_llm(messages: list, state: RecoveryState, max_tokens: int):
     return with_retry(
         lambda: client.messages.create(
             model=state.current_model, system=assemble_system_prompt(),
-            messages=messages, tools=BUILTIN_TOOLS, max_tokens=max_tokens),
+            messages=messages, tools=TOOLS, max_tokens=max_tokens),
         state)
 
 
@@ -813,7 +844,7 @@ def agent_loop(messages: list):
                                 "content": str(blocked)})
                 continue
 
-            output = call_tool_handler(BUILTIN_HANDLERS.get(block.name),
+            output = call_tool_handler(HANDLERS.get(block.name),
                                        block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
@@ -850,6 +881,16 @@ def _os_label() -> str:
     return f"{platform.system()} {platform.release()}"
 
 
+def _mcp_label() -> str:
+    mode = (os.getenv("MCP_MODE") or "off").strip().lower()
+    n = len(TOOLS) - len(BUILTIN_TOOLS)
+    if mode in ("off", "", "none", "false", "0"):
+        return "off  \033[90m(.env 里设 MCP_MODE=manual 或 sdk 开启)\033[0m"
+    impl = {"manual": "手写 client(mcp_manual/)", "sdk": "官方 SDK(mcp)"}.get(mode, mode)
+    status = f"已连接 · {n} 个远端工具" if n else "\033[31m连接失败(已降级)\033[0m"
+    return f"{mode}  \033[90m{impl}\033[0m  {status}"
+
+
 def print_banner():
     now = datetime.now()
     week = "一二三四五六日"[now.weekday()]
@@ -861,7 +902,9 @@ def print_banner():
         ("端点", endpoint),
         ("目录", str(WORKDIR)),
         ("环境", f"{_os_label()} · Python {platform.python_version()}"),
-        ("能力", f"{len(BUILTIN_TOOLS)} tools · {len(SKILL_REGISTRY)} skills"),
+        ("能力", f"{len(TOOLS)} tools ({len(TOOLS) - len(BUILTIN_TOOLS)} via MCP)"
+                 f" · {len(SKILL_REGISTRY)} skills"),
+        ("MCP", _mcp_label()),
     ]
     print(f"\033[1;36m{LOGO}\033[0m")
     for label, value in rows:
@@ -871,25 +914,31 @@ def print_banner():
 
 
 if __name__ == "__main__":
+    # 先连 MCP（子进程 + 握手 + tools/list），再打印 banner，这样能力数才准确
+    assemble_tool_pool()
     print_banner()
 
-    history: list = []
-    while True:
-        try:
-            query = input(f"\033[36m[{datetime.now():%H:%M}] myagent >> \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", "quit", ""):
-            break
-        trigger_hooks("UserPromptSubmit", query)
-        turn_start = len(history)
-        history.append({"role": "user", "content": query})
-        agent_loop(history)
-        # 打印本轮模型的文字回复
-        for msg in history[turn_start:]:
-            if msg.get("role") == "assistant":
-                for block in msg.get("content", []):
-                    if block_type(block) == "text":
-                        text = block["text"] if isinstance(block, dict) else block.text
-                        print(f"\033[32m{text}\033[0m")
-        print()
+    try:
+        history: list = []
+        while True:
+            try:
+                query = input(f"\033[36m[{datetime.now():%H:%M}] myagent >> \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if query.strip().lower() in ("q", "exit", "quit", ""):
+                break
+            trigger_hooks("UserPromptSubmit", query)
+            turn_start = len(history)
+            history.append({"role": "user", "content": query})
+            agent_loop(history)
+            # 打印本轮模型的文字回复
+            for msg in history[turn_start:]:
+                if msg.get("role") == "assistant":
+                    for block in msg.get("content", []):
+                        if block_type(block) == "text":
+                            text = block["text"] if isinstance(block, dict) else block.text
+                            print(f"\033[32m{text}\033[0m")
+            print()
+    finally:
+        # 退出时关掉 MCP server 子进程，别留孤儿进程
+        shutdown_mcp_servers()

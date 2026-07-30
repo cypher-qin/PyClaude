@@ -1,3 +1,6 @@
 anthropic>=0.39.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
+
+# 仅 MCP_MODE=sdk 需要（手写路径 mcp_manual/ 只用标准库，无需此项）
+mcp>=2.0.0

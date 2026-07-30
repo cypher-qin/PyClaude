@@ -100,6 +100,65 @@ T10/
 
 ---
 
+## MCP:两条实现路径,一键切换
+
+同一个 `.env` 开关,切换「手写实现」和「官方 SDK」两条路径——**连的是同一个 server,对模型完全等价**:
+
+```ini
+MCP_MODE=off      # 不启用(默认)
+MCP_MODE=manual   # 手写 client,纯 stdlib,能看到协议全过程
+MCP_MODE=sdk      # 官方 mcp SDK,生产级
+```
+
+### 文件
+
+```
+mcp_manual/
+  client.py          手写 MCP 客户端(JSON-RPC over stdio,后台读线程/id 路由/超时/优雅关闭)
+  github_server.py   手写 GitHub MCP server —— 把 tools/call 翻译成 GitHub REST API
+mcp_sdk_client.py    官方 SDK 客户端(异步→同步桥接,长连接)
+mcp_integration.py   统一入口:按 MCP_MODE 选路径,把工具并进工具池
+```
+
+### 一次调用的完整链路
+
+```
+启动:  起 server 子进程 → initialize(版本协商) → notifications/initialized → tools/list
+        → 工具按 mcp__github__* 并进工具池,写进发给模型的 tools[]
+运行:  模型输出 tool_use(mcp__github__search_repositories)
+        → permission_hook 审核 → 路由到对应 client → tools/call
+        → server 翻译成 GET api.github.com/search/repositories → 结果包成 content 回传
+        → 作为 tool_result 回灌上下文 → 模型据此回答
+退出:  关闭子进程
+```
+
+想看**每一条 JSON-RPC 报文**,打开调试开关:
+```ini
+MCP_DEBUG=1
+```
+
+### 切到真·官方 GitHub server(生产配置)
+
+`.env` 改一行即可(需 Docker Desktop 运行 + `GITHUB_TOKEN`):
+```ini
+MCP_SERVER_CMD=["docker","run","-i","--rm","-e","GITHUB_PERSONAL_ACCESS_TOKEN","ghcr.io/github/github-mcp-server"]
+```
+客户端代码**一行不用改**——这正是 MCP 的意义:换 server 不换 client。
+
+### 内置的三个 GitHub 工具
+
+`search_repositories`(搜仓库) / `get_repository`(仓库详情) / `get_readme`(读 README)。
+不填 `GITHUB_TOKEN` 也能用(公开搜索,限速较低);填了升到 5000 次/时。
+**token 只注入 server 子进程,不进模型上下文。**
+
+### 已知边界(教学实现的取舍)
+
+- 手写 client/server 走 **stdio + handshake 协议版本**(`2025-11-25`);MCP 2.0 新增的 modern 版本(`2026-07-28`)需要额外的 `discover` 流程,两条路径都未实现;
+- 手写路径**不支持 HTTP/SSE 传输和 OAuth**——要连远程托管 server 请用 `MCP_MODE=sdk`;
+- 只实现了 `tools`,未实现 `resources` / `prompts`。
+
+---
+
 ## License & 致谢
 
 本项目基于 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)（MIT License）提炼而来，`skills/` 与 `reference/s20_full_agent.py` 直接复用其代码，特此致谢。本项目自身采用 MIT License，详见 [LICENSE](LICENSE)。
