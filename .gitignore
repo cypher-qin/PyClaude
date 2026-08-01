@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# develop
+CLAUDE.md
+GAP_ANALYSIS.md

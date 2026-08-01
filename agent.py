@@ -12,7 +12,7 @@ myagent — 个人编码 Agent（基于 learn-claude-code 提炼）
     subagent            —— 子任务隔离上下文（s06）
     skill loading       —— 按需加载 skills/ 下的知识（s07）
     context compaction  —— 长会话自动压缩上下文（s08）
-    memory              —— 读取/追加 .memory/MEMORY.md（s09）
+    memory              —— 跨会话记忆：一事一文件 + 自动索引（s09，见 memory/）
     system prompt       —— 每轮运行时拼装（s10）
     error recovery      —— 429/529 重试、max_tokens 升配、prompt 过长回退（s11）
 
@@ -57,6 +57,10 @@ from dotenv import load_dotenv
 
 # MCP 集成（两条实现路径由 .env 的 MCP_MODE 切换；具体 client 是懒加载的）
 from mcp_integration import connect_mcp_servers, shutdown_mcp_servers
+from memory_integration import (bind_runtime, init_memory, inject_memories,
+                                memory_count, memory_system_prompt, memory_tools,
+                                note_tool_use, on_turn_end, session_compact_summary,
+                                start_prefetch)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -86,9 +90,7 @@ FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")  # 可选：529 过载时切换�
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
-MEMORY_DIR = WORKDIR / ".memory"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"   # 记忆目录由 memory/memdir.py 自己定位
 
 # —— 调参区 ——
 DEFAULT_MAX_TOKENS = 8000
@@ -310,24 +312,6 @@ scan_skills()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Memory —— 跨会话记忆（读 .memory/MEMORY.md，remember 工具追加）
-# ═══════════════════════════════════════════════════════════════════════════
-
-def read_memory() -> str:
-    if MEMORY_INDEX.exists():
-        return MEMORY_INDEX.read_text(encoding="utf-8")[:2000]
-    return ""
-
-
-def run_remember(note: str) -> str:
-    MEMORY_DIR.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    with MEMORY_INDEX.open("a", encoding="utf-8") as f:
-        f.write(f"- ({stamp}) {note.strip()}\n")
-    return "Remembered."
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  System Prompt —— 每轮运行时拼装（把技能目录 / 记忆 / 时间注入进去）
 # ═══════════════════════════════════════════════════════════════════════════
 IDENTITY = ("You are a coding agent. Act, don't explain. Use tools to make "
@@ -359,9 +343,9 @@ def assemble_system_prompt() -> str:
             "Platform: Windows. The `bash` tool runs via cmd.exe, NOT a Unix shell — "
             "use dir / type / findstr or `powershell -Command ...`, never cat/ls/grep. "
             "Prefer the dedicated file tools over the shell for file work.")
-    memories = read_memory()
-    if memories:
-        sections.append(f"Relevant memories:\n{memories}")
+    memory = memory_system_prompt()
+    if memory:
+        sections.append(memory)
     return "\n\n".join(sections)
 
 
@@ -448,6 +432,9 @@ def log_hook(block):
 
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
+# turn 结束：后台提炼记忆 + 低频整理 + 记一笔会话记忆。
+# 主线程紧接着阻塞在 input() 等用户打字，这段空闲正好给后台用完。
+register_hook("Stop", on_turn_end)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -470,12 +457,23 @@ def has_tool_use(content) -> bool:
     return any(getattr(b, "type", None) == "tool_use" for b in content)
 
 
-def spawn_subagent(description: str) -> str:
-    sub_tools = [t for t in BUILTIN_TOOLS if t["name"] in SUB_TOOL_NAMES]
+def spawn_subagent(description: str, *, system: str = SUB_SYSTEM,
+                   tools: list | None = None, handlers: dict | None = None,
+                   max_turns: int = 30) -> str:
+    """隔离上下文跑一个子任务。
+
+    默认仍是「编码子代理」，工具从 BUILTIN_* 里按 SUB_TOOL_NAMES 收窄——
+    约定不变：**子代理拿不到 MCP 工具**。
+    记忆子系统会显式传 tools/handlers 进来，换成一套只有 remember/forget 的
+    受限工具集（对标 CC 的 forked agent + 受限权限）。
+    """
+    sub_tools = tools if tools is not None else [
+        t for t in BUILTIN_TOOLS if t["name"] in SUB_TOOL_NAMES]
+    pool = handlers if handlers is not None else BUILTIN_HANDLERS
     messages = [{"role": "user", "content": description}]
-    for _ in range(30):
+    for _ in range(max_turns):
         response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM, messages=messages,
+            model=MODEL, system=system, messages=messages,
             tools=sub_tools, max_tokens=8000)
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
@@ -488,7 +486,7 @@ def spawn_subagent(description: str) -> str:
             if blocked:
                 output = str(blocked)
             else:
-                output = call_tool_handler(BUILTIN_HANDLERS.get(block.name),
+                output = call_tool_handler(pool.get(block.name),
                                            block.input, block.name)
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": str(output)})
@@ -499,6 +497,35 @@ def spawn_subagent(description: str) -> str:
             if text:
                 return text
     return "Subagent finished without a text summary."
+
+
+_side_query_no_thinking = True   # 端点若不认这个参数，首次失败后自动关掉
+
+
+def _side_query(prompt: str, max_tokens: int = 1000) -> str:
+    """一次性轻量模型调用（不带工具、不进历史），记忆子系统用它选记忆。
+
+    关掉 thinking——选记忆是分类，不是推理。kimi-k2.5 默认会先思考：实测
+    8.8~20.6s / 466~1000 输出 token，还常把预算耗光，连一个 text 块都出不来；
+    关掉后 1.3s / 16 token，选得一样准。
+    """
+    global _side_query_no_thinking
+    body = {"model": MODEL, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}]}
+    try:
+        extra = {"thinking": {"type": "disabled"}} if _side_query_no_thinking else {}
+        response = client.messages.create(**body, **extra)
+    except Exception:
+        if not _side_query_no_thinking:
+            raise
+        _side_query_no_thinking = False      # 换了厂商可能不认，降级重来一次
+        response = client.messages.create(**body)
+    return extract_text(response.content)
+
+
+# 把「怎么调模型」注入给记忆子系统：记忆包因此不反向 import agent.py，
+# 测试时也能换成假的，不打网络。
+bind_runtime(side_query=_side_query, fork_agent=spawn_subagent)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -591,7 +618,12 @@ def summarize_history(messages: list) -> str:
 def compact_history(messages: list) -> list:
     transcript = write_transcript(messages)
     print(f"  \033[36m[compact] 完整记录已存: {transcript}\033[0m")
-    summary = summarize_history(messages)
+    # 会话记忆够用就直接拿它当摘要，省掉一次模型调用（CC sessionMemoryCompact）
+    summary = session_compact_summary()
+    if summary:
+        print("  \033[36m[compact] 用会话记忆做摘要（省一次模型调用）\033[0m")
+    else:
+        summary = summarize_history(messages)
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 
 
@@ -727,11 +759,6 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
-    {"name": "remember",
-     "description": "Persist a durable note to memory for future sessions.",
-     "input_schema": {"type": "object",
-                      "properties": {"note": {"type": "string"}},
-                      "required": ["note"]}},
     {"name": "compact",
      "description": "Summarize earlier conversation and continue with less context.",
      "input_schema": {"type": "object",
@@ -742,7 +769,7 @@ BUILTIN_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "grep": run_grep,
     "todo_write": run_todo_write, "task": spawn_subagent,
-    "load_skill": load_skill, "remember": run_remember,
+    "load_skill": load_skill,
 }
 
 
@@ -755,20 +782,26 @@ def call_tool_handler(handler, args: dict, name: str) -> str:
         return f"Error: {e}"
 
 
-# ── 工具池装配：内置工具 + MCP 工具 ──
+# ── 工具池装配：内置工具 + 记忆工具 + MCP 工具 ──
 # MCP 工具在启动时通过 tools/list 动态发现，按 mcp__{server}__{tool} 并进来。
-# 装配后两者对模型、对 agent_loop、对权限钩子完全一视同仁。
+# 装配后三者对模型、对 agent_loop、对权限钩子完全一视同仁。
 TOOLS: list[dict] = list(BUILTIN_TOOLS)
 HANDLERS: dict = dict(BUILTIN_HANDLERS)
 
 
 def assemble_tool_pool():
-    """连接 MCP server（若 .env 里开了），把发现到的工具并入全局工具池。"""
+    """把记忆工具和 MCP 工具（若 .env 里开了）并入全局工具池。"""
     global TOOLS, HANDLERS
+    mem_tools, mem_handlers = memory_tools()
     mcp_tools, mcp_handlers = connect_mcp_servers()
-    TOOLS = list(BUILTIN_TOOLS) + mcp_tools
-    HANDLERS = {**BUILTIN_HANDLERS, **mcp_handlers}
+    TOOLS = list(BUILTIN_TOOLS) + mem_tools + mcp_tools
+    HANDLERS = {**BUILTIN_HANDLERS, **mem_handlers, **mcp_handlers}
     return TOOLS, HANDLERS
+
+
+def mcp_tool_count() -> int:
+    """按前缀数 MCP 工具——工具池里还有记忆工具，不能再用总数减内置数。"""
+    return sum(1 for t in TOOLS if t["name"].startswith("mcp__"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -786,12 +819,15 @@ def call_llm(messages: list, state: RecoveryState, max_tokens: int):
 def agent_loop(messages: list):
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
+    start_prefetch(messages)        # 后台选记忆，不阻塞下面的循环
+    snapshot = list(messages)
 
     while True:
+        snapshot = list(messages)   # 压缩前快照：提炼记忆要看没被打码的对话
         prepare_context(messages)
 
         try:
-            response = call_llm(messages, state, max_tokens)
+            response = call_llm(inject_memories(messages), state, max_tokens)
         except Exception as e:
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
@@ -821,7 +857,8 @@ def agent_loop(messages: list):
 
         # 没有 tool_use → 本轮结束
         if not has_tool_use(response.content):
-            trigger_hooks("Stop", messages)
+            # Stop 钩子拿压缩前快照 + 本轮最后一条回复，提炼记忆才看得到原话
+            trigger_hooks("Stop", snapshot + [messages[-1]])
             return
 
         results = []
@@ -844,6 +881,7 @@ def agent_loop(messages: list):
                                 "content": str(blocked)})
                 continue
 
+            note_tool_use(block.name, block.input)   # 动过记忆就别再自动提炼
             output = call_tool_handler(HANDLERS.get(block.name),
                                        block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
@@ -883,7 +921,7 @@ def _os_label() -> str:
 
 def _mcp_label() -> str:
     mode = (os.getenv("MCP_MODE") or "off").strip().lower()
-    n = len(TOOLS) - len(BUILTIN_TOOLS)
+    n = mcp_tool_count()
     if mode in ("off", "", "none", "false", "0"):
         return "off  \033[90m(.env 里设 MCP_MODE=manual 或 sdk 开启)\033[0m"
     impl = {"manual": "手写 client(mcp_manual/)", "sdk": "官方 SDK(mcp)"}.get(mode, mode)
@@ -902,8 +940,9 @@ def print_banner():
         ("端点", endpoint),
         ("目录", str(WORKDIR)),
         ("环境", f"{_os_label()} · Python {platform.python_version()}"),
-        ("能力", f"{len(TOOLS)} tools ({len(TOOLS) - len(BUILTIN_TOOLS)} via MCP)"
-                 f" · {len(SKILL_REGISTRY)} skills"),
+        ("能力", f"{len(TOOLS)} tools ({mcp_tool_count()} via MCP)"
+                 f" · {len(SKILL_REGISTRY)} skills"
+                 f" · {memory_count()} memories"),
         ("MCP", _mcp_label()),
     ]
     print(f"\033[1;36m{LOGO}\033[0m")
@@ -914,7 +953,9 @@ def print_banner():
 
 
 if __name__ == "__main__":
-    # 先连 MCP（子进程 + 握手 + tools/list），再打印 banner，这样能力数才准确
+    # 先做记忆自检（迁移旧格式 + 重建索引），再连 MCP（子进程 + 握手 + tools/list），
+    # 最后打印 banner——这样 banner 里的能力数和记忆数才是准的
+    init_memory()
     assemble_tool_pool()
     print_banner()
 
