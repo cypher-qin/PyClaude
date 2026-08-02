@@ -1,4 +1,4 @@
-# myagent
+# T10(Version B1)
 
 一个基于 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 提炼的**个人编码 Agent**，接入 Kimi（Moonshot）API。
 
