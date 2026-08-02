@@ -335,7 +335,15 @@ def replay_loaded() -> None:
 def session_banner_text() -> str:
     if not _enabled():
         return "off（SESSION_ENABLED=0）"
-    return f"{len(store.list_sessions(10 ** 9))} 个存档 · -c 续上 · /resume 切换"
+    return f"{len(store.list_sessions(10 ** 9))} 个存档"
+
+
+def session_usage_lines() -> list[str]:
+    """banner 下方的命令速查行（启动参数 + 斜杠命令）。禁用时只有一行说明。"""
+    if not _enabled():
+        return ["会话: 已禁用（SESSION_ENABLED=0）"]
+    return ["启动: -c 恢复最近 · -r [前缀] 恢复指定 · --list 列出存档 · --full 全量回放",
+            "会话: /resume 切换 · /new 新会话 · /sessions 列表"]
 
 
 # ── REPL 斜杠命令 ──────────────────────────────────────────────────────────
@@ -344,6 +352,11 @@ def handle_slash(cmd: str, history: list) -> bool:
     """处理 /resume /new /sessions。返回 True = 已处理（含取消），False = 未知命令。"""
     name, _, rest = cmd.partition(" ")
     name, rest = name.lower(), rest.strip()
+
+    if name == "/name":
+        print("T10 是历史上Cy-27原型机的名字。而T10则是我着手开发的第一个Agent \n")
+        return True
+
     if name not in ("/resume", "/new", "/sessions"):
         return False
     if not _enabled():

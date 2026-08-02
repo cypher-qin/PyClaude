@@ -62,7 +62,9 @@ from memory_integration import (bind_runtime, init_memory, inject_memories,
                                 note_tool_use, on_turn_end, session_compact_summary,
                                 start_prefetch)
 from session_integration import (handle_slash, replay_loaded, save_session,
-                                 session_banner_text, session_entry)
+                                 session_banner_text, session_entry,
+                                 session_usage_lines)
+from status_report import STATS, Spinner
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -478,6 +480,8 @@ def spawn_subagent(description: str, *, system: str = SUB_SYSTEM,
         response = client.messages.create(
             model=MODEL, system=system, messages=messages,
             tools=sub_tools, max_tokens=8000)
+        # 子代理只记会话账（可能跑在后台线程：不挂动画、不计耗时）
+        STATS.record(response.usage, 0.0, to_turn=False)
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             break
@@ -525,6 +529,7 @@ def _side_query(prompt: str, max_tokens: int = 1000) -> str:
     global _side_query_no_thinking
     body = {"model": MODEL, "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]}
+    started = time.monotonic()
     try:
         extra = {"thinking": {"type": "disabled"}} if _side_query_no_thinking else {}
         response = client.messages.create(**body, **extra)
@@ -533,6 +538,8 @@ def _side_query(prompt: str, max_tokens: int = 1000) -> str:
             raise
         _side_query_no_thinking = False      # 换了厂商可能不认，降级重来一次
         response = client.messages.create(**body)
+    # 旁路调用只记会话账：钱是真实花的，但不进本轮结算行
+    STATS.record(response.usage, time.monotonic() - started, to_turn=False)
     return extract_text(response.content)
 
 
@@ -821,11 +828,15 @@ def mcp_tool_count() -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def call_llm(messages: list, state: RecoveryState, max_tokens: int):
-    return with_retry(
-        lambda: client.messages.create(
-            model=state.current_model, system=assemble_system_prompt(),
-            messages=messages, tools=TOOLS, max_tokens=max_tokens),
-        state)
+    with Spinner():                     # P1：等待动画（非 TTY 自动静默）
+        started = time.monotonic()
+        response = with_retry(
+            lambda: client.messages.create(
+                model=state.current_model, system=assemble_system_prompt(),
+                messages=messages, tools=TOOLS, max_tokens=max_tokens),
+            state)
+    STATS.record(response.usage, time.monotonic() - started)   # P0：入账
+    return response
 
 
 def agent_loop(messages: list):
@@ -961,8 +972,11 @@ def print_banner():
     print(f"\033[1;36m{LOGO}\033[0m")
     for label, value in rows:
         print(f"  \033[1;36m{label}\033[0m  \033[37m{value}\033[0m")
-    print(f"\n  \033[90m回车发送 · q 退出 · /resume 切换会话 · 让我 compact 可压缩上下文 · "
-          f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认\033[0m\n")
+    print(f"\n  \033[90m回车发送 · q 退出 · 让我 compact 可压缩上下文 · "
+          f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认\033[0m")
+    for _line in session_usage_lines():   # 会话命令速查（禁用时是一行禁用说明）
+        print(f"  \033[90m{_line}\033[0m")
+    print()
 
 
 if __name__ == "__main__":
@@ -976,8 +990,10 @@ if __name__ == "__main__":
 
     try:
         while True:
+            # P2：提示符带上下文占用（本地序列化预算口径，非模型真实窗口）
+            ctx_pct = min(100, round(100 * estimate_size(history) / CONTEXT_LIMIT))
             try:
-                query = input(f"\033[36m[{datetime.now():%H:%M}] myagent >> \033[0m")
+                query = input(f"\033[36m[{datetime.now():%H:%M} · {ctx_pct}% ctx] myagent >> \033[0m")
             except (EOFError, KeyboardInterrupt):
                 break
             # 管道/重定向输入的首行可能带 BOM（PowerShell 管道必带）：
@@ -1002,6 +1018,10 @@ if __name__ == "__main__":
                         if block_type(block) == "text":
                             text = block["text"] if isinstance(block, dict) else block.text
                             print(f"\033[32m{text}\033[0m")
+            line = STATS.turn_line()            # P0：本轮结算
+            if line:
+                print(f"  \033[90m{line}\033[0m")
+            STATS.reset_turn()
             print()
     finally:
         # 退出时关掉 MCP server 子进程，别留孤儿进程

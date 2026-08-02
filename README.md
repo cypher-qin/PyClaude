@@ -80,6 +80,7 @@ T10/
   requirements.txt
   session_store.py       # 会话存档存储层：快照式 JSONL 落盘/读回/列目录
   session_integration.py # 会话恢复装配层：CLI(-c/-r/--list) + 斜杠命令 + 回放渲染
+  status_report.py       # 运行状态报告：等待动画 + token/耗时结算 + 上下文占用提示
   skills/                # 按需加载的知识包（每个子目录一个 SKILL.md）
     agent-builder/  code-review/  mcp-builder/  pdf/
   .memory/MEMORY.md      # 跨会话长期记忆（agent 可读写，你也能手改）
