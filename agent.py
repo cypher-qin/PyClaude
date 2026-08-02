@@ -61,6 +61,8 @@ from memory_integration import (bind_runtime, init_memory, inject_memories,
                                 memory_count, memory_system_prompt, memory_tools,
                                 note_tool_use, on_turn_end, session_compact_summary,
                                 start_prefetch)
+from session_integration import (handle_slash, replay_loaded, save_session,
+                                 session_banner_text, session_entry)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -73,9 +75,9 @@ from memory_integration import (bind_runtime, init_memory, inject_memories,
 #  代码本身一行都不用动。SDK 会自动从环境变量读取 ANTHROPIC_API_KEY。
 # ═══════════════════════════════════════════════════════════════════════════
 # .env 优先于外部环境变量（override=True），避免 shell 里的旧 key 悄悄生效。
-# 例外：MCP 开关允许命令行临时覆盖，方便 `MCP_MODE=sdk python agent.py` 这样 A/B 对比。
+# 例外：MCP / SESSION 开关允许命令行临时覆盖，方便 A/B 对比与测试。
 _CLI_OVERRIDES = {k: v for k, v in os.environ.items()
-                  if k.startswith("MCP_")}
+                  if k.startswith(("MCP_", "SESSION_"))}
 load_dotenv(override=True)
 os.environ.update(_CLI_OVERRIDES)
 
@@ -101,6 +103,7 @@ MAX_RECOVERY_RETRIES = 2
 BASE_DELAY_MS = 500
 CONTEXT_LIMIT = 50000          # messages 序列化字节数超过此值触发摘要压缩
 KEEP_RECENT_TOOL_RESULTS = 3   # micro_compact 保留最近几条完整 tool_result
+SUMMARY_MAX_TOKENS = 2000      # 压缩摘要预算（关 thinking 后实测只用 ~262）
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 PROMPT = "\033[36mmyagent >> \033[0m"
 
@@ -503,11 +506,21 @@ _side_query_no_thinking = True   # 端点若不认这个参数，首次失败后
 
 
 def _side_query(prompt: str, max_tokens: int = 1000) -> str:
-    """一次性轻量模型调用（不带工具、不进历史），记忆子系统用它选记忆。
+    """旁路提问：一次性模型调用，不带 system、不带工具、不进 messages 历史。
 
-    关掉 thinking——选记忆是分类，不是推理。kimi-k2.5 默认会先思考：实测
-    8.8~20.6s / 466~1000 输出 token，还常把预算耗光，连一个 text 块都出不来；
-    关掉后 1.3s / 16 token，选得一样准。
+    用来回答 **harness 自己的问题**（哪几条记忆相关 / 这段对话怎么摘要），
+    而不是用户的问题——所以结果不该污染对话。两个调用方：
+    记忆子系统选记忆（`bind_runtime`）、`summarize_history()` 压缩摘要。
+
+    **关掉 thinking**：这两件事都不是推理任务。kimi-k2.5 默认会先思考，实测：
+
+        选记忆   带思考 8.8~20.6s / 466~1000 token，常把预算耗光连 text 块都没有
+                 关掉后 1.3s / 16 token，选得一样准
+        摘要     带思考 均 15.5s / 990 token；关掉后 均 4.7s / 262 token
+                 关键事实保留 5/5 完全一致（3.3× 提速，省 73% token）
+
+    预算耗光的后果不只是慢：`extract_text` 会返回空字符串。摘要一旦为空，
+    `compact_history` 就会把整段历史换成 "(empty summary)"。
     """
     global _side_query_no_thinking
     body = {"model": MODEL, "max_tokens": max_tokens,
@@ -606,13 +619,12 @@ def write_transcript(messages: list) -> Path:
 
 
 def summarize_history(messages: list) -> str:
+    """把一段对话压成摘要。走 _side_query：同样是旁路提问，同样不该开 thinking。"""
     conversation = json.dumps(messages, default=str, ensure_ascii=False)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue. "
               "Preserve current goal, key findings, changed files, remaining work, "
               "and user constraints.\n\n" + conversation)
-    response = client.messages.create(
-        model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=2000)
-    return extract_text(response.content) or "(empty summary)"
+    return _side_query(prompt, SUMMARY_MAX_TOKENS) or "(empty summary)"
 
 
 def compact_history(messages: list) -> list:
@@ -944,34 +956,45 @@ def print_banner():
                  f" · {len(SKILL_REGISTRY)} skills"
                  f" · {memory_count()} memories"),
         ("MCP", _mcp_label()),
+        ("会话", session_banner_text()),
     ]
     print(f"\033[1;36m{LOGO}\033[0m")
     for label, value in rows:
         print(f"  \033[1;36m{label}\033[0m  \033[37m{value}\033[0m")
-    print(f"\n  \033[90m回车发送 · q 退出 · 让我 compact 可压缩上下文 · "
+    print(f"\n  \033[90m回车发送 · q 退出 · /resume 切换会话 · 让我 compact 可压缩上下文 · "
           f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认\033[0m\n")
 
 
 if __name__ == "__main__":
     # 先做记忆自检（迁移旧格式 + 重建索引），再连 MCP（子进程 + 握手 + tools/list），
-    # 最后打印 banner——这样 banner 里的能力数和记忆数才是准的
+    # 再处理会话恢复（-c/-r/--list），最后打印 banner——banner 里的数目才是准的
     init_memory()
     assemble_tool_pool()
+    history = session_entry()       # 无参数时返回 []，即新会话
     print_banner()
+    replay_loaded()                 # 刚恢复：分隔带 + 最近 N 轮回放；否则无输出
 
     try:
-        history: list = []
         while True:
             try:
                 query = input(f"\033[36m[{datetime.now():%H:%M}] myagent >> \033[0m")
             except (EOFError, KeyboardInterrupt):
                 break
+            # 管道/重定向输入的首行可能带 BOM（PowerShell 管道必带）：
+            # 不去掉的话 "\ufeff/resume" 不以 / 开头，斜杠命令会被误发给模型
+            query = query.lstrip("\ufeff")
             if query.strip().lower() in ("q", "exit", "quit", ""):
                 break
+            if query.strip().startswith("/"):
+                # 斜杠命令（/resume /new /sessions）在轮边界处理，不进模型
+                if not handle_slash(query.strip(), history):
+                    print("  \033[90m未知命令，可用：/resume /new /sessions\033[0m")
+                continue
             trigger_hooks("UserPromptSubmit", query)
             turn_start = len(history)
             history.append({"role": "user", "content": query})
             agent_loop(history)
+            save_session(history)   # 轮边界落盘：快照重写当前存档
             # 打印本轮模型的文字回复
             for msg in history[turn_start:]:
                 if msg.get("role") == "assistant":

@@ -4,6 +4,7 @@
 # runtime state
 .memory/
 .transcripts/
+.sessions/
 .tasks/
 .mailboxes/
 .task_outputs/
@@ -17,3 +18,4 @@ venv/
 # develop
 CLAUDE.md
 GAP_ANALYSIS.md
+docs

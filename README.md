@@ -28,6 +28,26 @@ python agent.py
 
 ---
 
+## 会话存档与恢复
+
+每轮对话结束，完整上下文自动快照写入 `.sessions/`（原子重写，进程崩溃只丢进行中的半轮）。
+参照 Claude Code / Codex CLI 的恢复三件套：
+
+```bash
+python agent.py -c            # 恢复最近一次会话
+python agent.py -r [id前缀]   # 带前缀直接匹配；不带则交互选择
+python agent.py --list        # 列出存档后退出
+python agent.py -c --full     # 全量回放（默认只回放最近 5 轮，SESSION_REPLAY 可配）
+```
+
+会话内切换：`/resume`（选择并切换）、`/new`（开新会话）、`/sessions`（列表）。
+切换时旧对话留在终端 scrollback 可回翻，以分隔带区分；恢复后续写同一存档文件，不 fork。
+
+与 `.transcripts/` 的分工：transcripts 是压缩前的冷备份（只写不读，审计层）；
+`.sessions/` 是恢复层（写了也读）。实现思路见 [docs/SESSION.md](docs/SESSION.md)。
+
+---
+
 ## 接入 / 更换模型（唯一改动点：`.env`）
 
 代码用的是 Anthropic 官方 SDK，它原生支持「Anthropic 兼容」的第三方网关。**换厂商不用改一行代码**，只改 `.env`：
@@ -58,9 +78,12 @@ T10/
   agent.py               # ★ 主程序：一个循环 + 全部机制（改这里做二次开发）
   .env / .env.example    # ★ 配置（接你的 Kimi Key）
   requirements.txt
+  session_store.py       # 会话存档存储层：快照式 JSONL 落盘/读回/列目录
+  session_integration.py # 会话恢复装配层：CLI(-c/-r/--list) + 斜杠命令 + 回放渲染
   skills/                # 按需加载的知识包（每个子目录一个 SKILL.md）
     agent-builder/  code-review/  mcp-builder/  pdf/
   .memory/MEMORY.md      # 跨会话长期记忆（agent 可读写，你也能手改）
+  .sessions/             # 会话存档（运行时生成，已 gitignore）
   reference/
     s20_full_agent.py    # 原仓库最全版本（含 teams/cron/worktree/MCP），需要高级功能时参考
   .venv/                 # 内置虚拟环境（已装好依赖）
@@ -116,8 +139,8 @@ MCP_MODE=sdk      # 官方 mcp SDK,生产级
 mcp_manual/
   client.py          手写 MCP 客户端(JSON-RPC over stdio,后台读线程/id 路由/超时/优雅关闭)
   github_server.py   手写 GitHub MCP server —— 把 tools/call 翻译成 GitHub REST API
-mcp_sdk_client.py    官方 SDK 客户端(异步→同步桥接,长连接)
-mcp_integration.py   统一入口:按 MCP_MODE 选路径,把工具并进工具池
+  mcp_sdk_client.py    官方 SDK 客户端(异步→同步桥接,长连接)
+  mcp_integration.py   统一入口:按 MCP_MODE 选路径,把工具并进工具池
 ```
 
 ### 一次调用的完整链路
