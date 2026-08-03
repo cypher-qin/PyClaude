@@ -80,11 +80,14 @@ T10/
   requirements.txt
   session_store.py       # 会话存档存储层：快照式 JSONL 落盘/读回/列目录
   session_integration.py # 会话恢复装配层：CLI(-c/-r/--list) + 斜杠命令 + 回放渲染
+  tasks/store.py         # 任务存储层：TaskRecord + 文件锁 + 依赖图（对齐 CC）
+  task_integration.py    # 任务装配层：task_create/update/get/list 四工具
   status_report.py       # 运行状态报告：等待动画 + token/耗时结算 + 上下文占用提示
   skills/                # 按需加载的知识包（每个子目录一个 SKILL.md）
     agent-builder/  code-review/  mcp-builder/  pdf/
   .memory/MEMORY.md      # 跨会话长期记忆（agent 可读写，你也能手改）
   .sessions/             # 会话存档（运行时生成，已 gitignore）
+  .tasks/                # 任务图（运行时生成，已 gitignore）
   reference/
     s20_full_agent.py    # 原仓库最全版本（含 teams/cron/worktree/MCP），需要高级功能时参考
   .venv/                 # 内置虚拟环境（已装好依赖）
@@ -108,8 +111,15 @@ T10/
 | memory | 读 `.memory/MEMORY.md` + `remember` 追加 | s09 |
 | system prompt | 每轮运行时拼装（技能目录/记忆/时间） | s10 |
 | error recovery | 429 退避 / 529 切备用模型 / prompt 过长回退 | s11 |
+| task system | 跨会话任务图：依赖/认领/解锁，结构对齐 CC | s12 |
 
-**刻意没有搬进来**（需要时看 `reference/s20_full_agent.py`）：task graph、background threads、cron、agent teams、team protocols、autonomous agents、worktree isolation、MCP（原仓库是 mock，非真实实现）。
+**刻意没有搬进来**（需要时看 `reference/s20_full_agent.py`）：background threads、cron、agent teams、team protocols、autonomous agents、worktree isolation、MCP（原仓库是 mock，非真实实现）。
+
+任务系统与 `todo_write` 的分工：`todo_write` 是本轮执行清单（内存态）；
+`task_create / task_update / task_get / task_list` 是跨会话持久任务图，
+带依赖（blockedBy/blocks 双向 + 环检测）、认领（owner 冲突保护）、
+解锁通知和 release 恢复路径，存在 `.tasks/` 下，`TASKS_ENABLED=0` 可关。
+实现取舍见 [docs/TASK.md](docs/TASK.md)。
 
 ---
 

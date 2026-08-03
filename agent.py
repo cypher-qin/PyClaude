@@ -15,9 +15,11 @@ myagent — 个人编码 Agent（基于 learn-claude-code 提炼）
     memory              —— 跨会话记忆：一事一文件 + 自动索引（s09，见 memory/）
     system prompt       —— 每轮运行时拼装（s10）
     error recovery      —— 429/529 重试、max_tokens 升配、prompt 过长回退（s11）
+    task system         —— 跨会话任务图：依赖/认领/解锁，结构对齐 CC（s12，见 tasks/）
+    plan nudge          —— 规划催办：启发式打分 + 可忽略提醒的副本注入（见 plan_integration.py）
 
 刻意没有搬进来（属于演示/多机协作，需要时看 reference/s20_full_agent.py）：
-    task graph / background threads / cron / agent teams / worktree / MCP(mock)
+    background threads / cron / agent teams / worktree / MCP(mock)
 
 用法:
     pip install -r requirements.txt
@@ -65,6 +67,9 @@ from session_integration import (handle_slash, replay_loaded, save_session,
                                  session_banner_text, session_entry,
                                  session_usage_lines)
 from status_report import STATS, Spinner
+from task_integration import task_count, task_system_prompt, task_tools
+from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
+                              plan_notify_todos, plan_turn_start)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -124,14 +129,35 @@ def is_inside_workspace(path: Path) -> bool:
     return path.is_relative_to(WORKDIR)
 
 
+def _console_codec() -> str:
+    """控制台 OEM 代码页——cmd 内置命令(dir/type/ipconfig 等)重定向输出用的编码。
+
+    中文 Windows 是 CP936(=GBK)，英文系统是 CP437 等，所以不写死、探测真实值。
+    非 Windows 或探测失败回退 gbk。启动时算一次即可，进程内代码页不会变。"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            pass
+    return "gbk"
+
+
+_CONSOLE_CODEC = _console_codec()
+
+
 def _decode_console(raw: bytes) -> str:
-    """中文 Windows 上命令输出编码不统一：先按 UTF-8，失败回退 GBK，最后兜底替换。"""
-    for enc in ("utf-8", "gbk"):
+    """按控制台真实代码页解码，UTF-8 作回退(个别现代工具输出 UTF-8)。
+
+    不再「UTF-8 优先」瞎猜：GBK 字节恰好构成合法 UTF-8 序列时会被误读成乱码，
+    且是否踩中取决于输出内容——同一条 dir 有时正常有时乱码。改成按 OEM 代码页
+    (中文系统即 GBK)解码后，内置命令输出就稳定了。"""
+    for enc in (_CONSOLE_CODEC, "utf-8"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+    return raw.decode(_CONSOLE_CODEC, errors="replace")
 
 
 def run_bash(command: str) -> str:
@@ -261,7 +287,13 @@ def run_todo_write(todos: list) -> str:
     for t in CURRENT_TODOS:
         mark = {"completed": "x", "in_progress": ">", "pending": " "}[t["status"]]
         print(f"  \033[33m[{mark}] {t['content']}\033[0m")
-    return f"Updated {len(CURRENT_TODOS)} todos"
+    plan_notify_todos(CURRENT_TODOS)   # 快照进规划子系统（催办背诵/压缩补发用）
+    done = sum(1 for t in CURRENT_TODOS if t["status"] == "completed")
+    marks = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
+    lines = "\n".join(f"{marks[t['status']]} {t['content']}" for t in CURRENT_TODOS)
+    # 返回完整清单 = 每次调用顺带完成一次「计划背诵」，对抗长任务的上下文漂移
+    return (f"Updated {len(CURRENT_TODOS)} todos ({done} completed).\n{lines}\n"
+            "Keep exactly one in_progress; update statuses as you work.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -327,7 +359,6 @@ def assemble_system_prompt() -> str:
     sections = [
         IDENTITY,
         f"Working directory: {WORKDIR}",
-        f"Current time: {datetime.now().isoformat(timespec='seconds')}",
         "Skills catalog:\n" + list_skills()
         + "\nUse load_skill(name) to expand a skill when it is relevant.",
     ]
@@ -351,6 +382,12 @@ def assemble_system_prompt() -> str:
     memory = memory_system_prompt()
     if memory:
         sections.append(memory)
+    tasks = task_system_prompt()
+    if tasks:
+        sections.append(tasks)
+    guidance = plan_guidance()
+    if guidance:
+        sections.append(guidance)
     return "\n\n".join(sections)
 
 
@@ -437,6 +474,8 @@ def log_hook(block):
 
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
+# 轮开始：给查询做复杂度打分、重置催办状态（plan_integration）
+register_hook("UserPromptSubmit", plan_turn_start)
 # turn 结束：后台提炼记忆 + 低频整理 + 记一笔会话记忆。
 # 主线程紧接着阻塞在 input() 等用户打字，这段空闲正好给后台用完。
 register_hook("Stop", on_turn_end)
@@ -760,7 +799,15 @@ BUILTIN_TOOLS = [
                                      "glob": {"type": "string"}},
                       "required": ["pattern"]}},
     {"name": "todo_write",
-     "description": "Create/replace the session task list (plan before executing).",
+     "description": (
+        "Manage the session's task checklist — a lightweight plan for "
+        "multi-step work. WHEN TO USE: the request needs 3+ distinct steps, "
+        "spans multiple files, or the user lists several things to do. "
+        "WHEN NOT TO USE: simple questions, lookups, single-step edits, or "
+        "conversational turns — just answer directly. Pass the FULL list "
+        "each call (it replaces the previous one). Keep exactly one item "
+        "in_progress and mark items completed as you finish them — update "
+        "the list while working, not only at the end."),
      "input_schema": {"type": "object",
                       "properties": {"todos": {"type": "array", "items": {
                           "type": "object",
@@ -813,8 +860,9 @@ def assemble_tool_pool():
     global TOOLS, HANDLERS
     mem_tools, mem_handlers = memory_tools()
     mcp_tools, mcp_handlers = connect_mcp_servers()
-    TOOLS = list(BUILTIN_TOOLS) + mem_tools + mcp_tools
-    HANDLERS = {**BUILTIN_HANDLERS, **mem_handlers, **mcp_handlers}
+    tk_tools, tk_handlers = task_tools()
+    TOOLS = list(BUILTIN_TOOLS) + mem_tools + tk_tools + mcp_tools
+    HANDLERS = {**BUILTIN_HANDLERS, **mem_handlers, **tk_handlers, **mcp_handlers}
     return TOOLS, HANDLERS
 
 
@@ -850,7 +898,9 @@ def agent_loop(messages: list):
         prepare_context(messages)
 
         try:
-            response = call_llm(inject_memories(messages), state, max_tokens)
+            # inject_plan 包在最外层：规划催办只在发给模型的副本里，不进历史
+            response = call_llm(inject_plan(inject_memories(messages)),
+                                state, max_tokens)
         except Exception as e:
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
@@ -905,6 +955,7 @@ def agent_loop(messages: list):
                 continue
 
             note_tool_use(block.name, block.input)   # 动过记忆就别再自动提炼
+            plan_note_tool(block.name)               # 规划催办计数（同位置=被拦截的不计数）
             output = call_tool_handler(HANDLERS.get(block.name),
                                        block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
@@ -965,7 +1016,8 @@ def print_banner():
         ("环境", f"{_os_label()} · Python {platform.python_version()}"),
         ("能力", f"{len(TOOLS)} tools ({mcp_tool_count()} via MCP)"
                  f" · {len(SKILL_REGISTRY)} skills"
-                 f" · {memory_count()} memories"),
+                 f" · {memory_count()} memories"
+                 f" · {task_count()} open tasks"),
         ("MCP", _mcp_label()),
         ("会话", session_banner_text()),
     ]
