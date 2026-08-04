@@ -17,9 +17,10 @@ myagent — 个人编码 Agent（基于 learn-claude-code 提炼）
     error recovery      —— 429/529 重试、max_tokens 升配、prompt 过长回退（s11）
     task system         —— 跨会话任务图：依赖/认领/解锁，结构对齐 CC（s12，见 tasks/）
     plan nudge          —— 规划催办：启发式打分 + 可忽略提醒的副本注入（见 plan_integration.py）
+    background tasks    —— 后台 bash：run_in_background 派发 + 完成通知 + 可查可停（s13，见 background_integration.py）
 
 刻意没有搬进来（属于演示/多机协作，需要时看 reference/s20_full_agent.py）：
-    background threads / cron / agent teams / worktree / MCP(mock)
+    cron / agent teams / worktree / MCP(mock)
 
 用法:
     pip install -r requirements.txt
@@ -70,6 +71,8 @@ from status_report import STATS, Spinner
 from task_integration import task_count, task_system_prompt, task_tools
 from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
                               plan_notify_todos, plan_turn_start)
+from background_integration import (bg_bind, bg_collect, bg_enabled, bg_shutdown,
+                                    bg_start, bg_system_prompt, bg_tools)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -84,7 +87,7 @@ from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
 # .env 优先于外部环境变量（override=True），避免 shell 里的旧 key 悄悄生效。
 # 例外：MCP / SESSION 开关允许命令行临时覆盖，方便 A/B 对比与测试。
 _CLI_OVERRIDES = {k: v for k, v in os.environ.items()
-                  if k.startswith(("MCP_", "SESSION_"))}
+                  if k.startswith(("MCP_", "SESSION_", "BG_"))}
 load_dotenv(override=True)
 os.environ.update(_CLI_OVERRIDES)
 
@@ -160,9 +163,11 @@ def _decode_console(raw: bytes) -> str:
     return raw.decode(_CONSOLE_CODEC, errors="replace")
 
 
-def run_bash(command: str) -> str:
+def run_bash(command: str, run_in_background: bool = False) -> str:
     # 注意：capture_output 拿字节再手动解码，避免 text=True 在中文 Windows 用 GBK
     # 解码非 GBK 输出时崩溃（会让 stdout 变 None 触发 None+str）。
+    # run_in_background 仅为 schema 兼容而接收：后台派发在 agent_loop 里拦截
+    # （bg_start），走到这里说明子系统关闭或是子代理调用 → 前台执行。
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, timeout=120)
@@ -388,6 +393,9 @@ def assemble_system_prompt() -> str:
     guidance = plan_guidance()
     if guidance:
         sections.append(guidance)
+    bg = bg_system_prompt()
+    if bg:
+        sections.append(bg)
     return "\n\n".join(sections)
 
 
@@ -585,6 +593,8 @@ def _side_query(prompt: str, max_tokens: int = 1000) -> str:
 # 把「怎么调模型」注入给记忆子系统：记忆包因此不反向 import agent.py，
 # 测试时也能换成假的，不打网络。
 bind_runtime(side_query=_side_query, fork_agent=spawn_subagent)
+# 同理把控制台解码注入后台子系统（避免它反向 import agent.py）
+bg_bind(decode=_decode_console)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -769,7 +779,14 @@ def is_prompt_too_long_error(e: Exception) -> bool:
 BUILTIN_TOOLS = [
     {"name": "bash", "description": "Run a shell command in the working directory.",
      "input_schema": {"type": "object",
-                      "properties": {"command": {"type": "string"}},
+                      "properties": {
+                          "command": {"type": "string"},
+                          "run_in_background": {"type": "boolean",
+                                                "description": "true = run detached; "
+                                                "returns a task id immediately and a "
+                                                "<task_notification> arrives on "
+                                                "completion. Only for long-running "
+                                                "commands."}},
                       "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents (optionally a slice).",
      "input_schema": {"type": "object",
@@ -856,13 +873,15 @@ HANDLERS: dict = dict(BUILTIN_HANDLERS)
 
 
 def assemble_tool_pool():
-    """把记忆工具和 MCP 工具（若 .env 里开了）并入全局工具池。"""
+    """把记忆/任务/后台/MCP 工具（若 .env 里开了）并入全局工具池。"""
     global TOOLS, HANDLERS
     mem_tools, mem_handlers = memory_tools()
     mcp_tools, mcp_handlers = connect_mcp_servers()
     tk_tools, tk_handlers = task_tools()
-    TOOLS = list(BUILTIN_TOOLS) + mem_tools + tk_tools + mcp_tools
-    HANDLERS = {**BUILTIN_HANDLERS, **mem_handlers, **tk_handlers, **mcp_handlers}
+    bg_tk, bg_hd = bg_tools()
+    TOOLS = list(BUILTIN_TOOLS) + mem_tools + tk_tools + bg_tk + mcp_tools
+    HANDLERS = {**BUILTIN_HANDLERS, **mem_handlers, **tk_handlers,
+                **bg_hd, **mcp_handlers}
     return TOOLS, HANDLERS
 
 
@@ -896,6 +915,13 @@ def agent_loop(messages: list):
     while True:
         snapshot = list(messages)   # 压缩前快照：提炼记忆要看没被打码的对话
         prepare_context(messages)
+
+        # 后台任务完成通知：持久化进历史（是数据不是提醒），作为独立 user 消息。
+        # 本轮工具执行期间/上一轮结束后（input() 空闲窗口）完成的任务都在这里送达。
+        bg_notes = bg_collect()
+        if bg_notes:
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": n} for n in bg_notes]})
 
         try:
             # inject_plan 包在最外层：规划催办只在发给模型的副本里，不进历史
@@ -956,8 +982,13 @@ def agent_loop(messages: list):
 
             note_tool_use(block.name, block.input)   # 动过记忆就别再自动提炼
             plan_note_tool(block.name)               # 规划催办计数（同位置=被拦截的不计数）
-            output = call_tool_handler(HANDLERS.get(block.name),
-                                       block.input, block.name)
+            if (block.name == "bash" and block.input.get("run_in_background")
+                    and bg_enabled()):
+                # 慢命令丢后台：立即回占位文本，完成后以 <task_notification> 通知
+                output = bg_start(block.input.get("command", ""))
+            else:
+                output = call_tool_handler(HANDLERS.get(block.name),
+                                           block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
             results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -965,6 +996,8 @@ def agent_loop(messages: list):
 
         if compacted_now:
             continue
+        # 搭车注入：本轮工具执行期间完成的后台任务，随 tool_result 一起送回
+        results.extend({"type": "text", "text": n} for n in bg_collect())
         messages.append({"role": "user", "content": results})
 
 
@@ -1076,5 +1109,7 @@ if __name__ == "__main__":
             STATS.reset_turn()
             print()
     finally:
-        # 退出时关掉 MCP server 子进程，别留孤儿进程
+        # 退出时先杀后台任务（shell=True 子进程不会随 daemon 线程死，须杀进程树），
+        # 再关 MCP server 子进程，别留孤儿进程
+        bg_shutdown()
         shutdown_mcp_servers()

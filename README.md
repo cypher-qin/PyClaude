@@ -2,7 +2,7 @@
 
 一个基于 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 提炼的**个人编码 Agent**，接入 Kimi（Moonshot）API。
 
-单文件 `agent.py`（约 500 行），保留了「单人日常使用」真正有用的 harness 机制，去掉了偏演示的多机协作/定时/MCP-mock 部分。可直接使用，也方便你后续迭代。
+主程序 `agent.py`（约 1100 行）+ 一组 `*_integration.py` 子系统装配层，保留了「单人日常使用」真正有用的 harness 机制，去掉了偏演示的多机协作/定时/MCP-mock 部分。可直接使用，也方便你后续迭代。
 
 ---
 
@@ -82,7 +82,10 @@ T10/
   session_integration.py # 会话恢复装配层：CLI(-c/-r/--list) + 斜杠命令 + 回放渲染
   tasks/store.py         # 任务存储层：TaskRecord + 文件锁 + 依赖图（对齐 CC）
   task_integration.py    # 任务装配层：task_create/update/get/list 四工具
+  plan_integration.py    # 规划催办装配层：启发式打分 + 可忽略提醒（副本注入）
+  background_integration.py # 后台任务装配层：run_in_background 派发 + 通知 + bg_list/output/kill
   status_report.py       # 运行状态报告：等待动画 + token/耗时结算 + 上下文占用提示
+  docs/                  # 子系统文档（BACKGROUND/MEMORY/SESSION/TASK/CLAUDE/GAP_ANALYSIS…）
   skills/                # 按需加载的知识包（每个子目录一个 SKILL.md）
     agent-builder/  code-review/  mcp-builder/  pdf/
   .memory/MEMORY.md      # 跨会话长期记忆（agent 可读写，你也能手改）
@@ -112,14 +115,22 @@ T10/
 | system prompt | 每轮运行时拼装（技能目录/记忆/时间） | s10 |
 | error recovery | 429 退避 / 529 切备用模型 / prompt 过长回退 | s11 |
 | task system | 跨会话任务图：依赖/认领/解锁，结构对齐 CC | s12 |
+| background tasks | 慢命令后台执行：run_in_background + 完成通知 + 可查可停 | s13 |
+| plan nudge | 规划催办：启发式打分 + 温和可忽略提醒 | s05 改进 |
 
-**刻意没有搬进来**（需要时看 `reference/s20_full_agent.py`）：background threads、cron、agent teams、team protocols、autonomous agents、worktree isolation、MCP（原仓库是 mock，非真实实现）。
+**刻意没有搬进来**（需要时看 `reference/s20_full_agent.py`）：cron、agent teams、team protocols、autonomous agents、worktree isolation、MCP（原仓库是 mock，非真实实现）。
 
 任务系统与 `todo_write` 的分工：`todo_write` 是本轮执行清单（内存态）；
 `task_create / task_update / task_get / task_list` 是跨会话持久任务图，
 带依赖（blockedBy/blocks 双向 + 环检测）、认领（owner 冲突保护）、
 解锁通知和 release 恢复路径，存在 `.tasks/` 下，`TASKS_ENABLED=0` 可关。
 实现取舍见 [docs/TASK.md](docs/TASK.md)。
+
+后台任务是独立子系统：`bash` 带 `run_in_background=true` 即丢后台执行，
+立即返回任务 id 继续干别的，完成后以 `<task_notification>` 送回对话；
+`bg_output` 随时看输出、`bg_kill` 停任务，`BG_TASKS_ENABLED=0` 可关。
+对标真实 Claude Code（显式参数、通知进后续轮次、可查可停），不照抄教学版。
+实现细节见 [docs/BACKGROUND.md](docs/BACKGROUND.md)。
 
 ---
 
