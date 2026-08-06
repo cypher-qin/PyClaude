@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 import session_store as store
+from status_report import STATS
 
 # agent.py 里的合成消息（不算用户轮次，回放时特殊渲染）。值与 agent.py 的
 # CONTINUATION_PROMPT 保持一致；不 import 是为了守住装配方向——agent.py
@@ -80,6 +81,25 @@ _current: dict | None = None              # {"path","created_at","title","resume
 _loaded: tuple[dict, list] | None = None  # 启动恢复待回放：(meta, history)
 _full_replay = False                      # --full 覆盖 SESSION_REPLAY
 
+# 会话状态恢复钩子：fn(history) 恢复（-c/-r//resume），fn(None) 清空（/new）。
+# agent.py 注册 restore_todos_from_history。回调注册而非直接 import，守住
+# 装配方向——这里绝不反向 import agent.py。
+_restore_hook = None
+
+
+def set_restore_hook(fn) -> None:
+    global _restore_hook
+    _restore_hook = fn
+
+
+def _notify_restore(history) -> None:
+    if _restore_hook is None:
+        return
+    try:
+        _restore_hook(history)
+    except Exception as e:
+        _warn("恢复会话状态", e)
+
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -107,7 +127,8 @@ def _count_turns(history: list) -> int:
 # ── 写入 ──────────────────────────────────────────────────────────────────
 
 def save_session(history: list) -> None:
-    """轮边界落盘。REPL 在 agent_loop 返回后调用；崩溃只丢进行中的半轮。"""
+    """快照落盘。REPL 轮边界 + agent_loop 每次消息追加后都会调用——
+    增量落盘，手动终止最多丢进行中的一个工具调用。"""
     global _current
     if not _enabled() or not history:
         return
@@ -122,7 +143,9 @@ def save_session(history: list) -> None:
                 "model": os.getenv("MODEL_ID", ""),
                 "title": _current["title"],
                 "turns": _count_turns(history),
-                "resume_count": _current["resume_count"]}
+                "resume_count": _current["resume_count"],
+                # token 账随会话持久化：跨 resume 的任务预算才是真预算
+                "tokens": STATS.snapshot_tokens()}
         store.save(_current["path"], history, meta)
     except Exception as e:
         _warn("保存会话", e)
@@ -135,6 +158,7 @@ def _adopt(path: Path, meta: dict) -> None:
                 "created_at": meta.get("created_at") or _now(),
                 "title": meta.get("title") or "(无标题)",
                 "resume_count": int(meta.get("resume_count") or 0) + 1}
+    STATS.restore(meta.get("tokens"))   # 恢复累计用量与预算授权额度
 
 
 # ── 列表与选择 ─────────────────────────────────────────────────────────────
@@ -317,6 +341,7 @@ def session_entry() -> list:
     if meta.get("_bad_lines"):
         print(f"\033[33m[session] 存档有 {meta['_bad_lines']} 行损坏，已跳过\033[0m")
     _adopt(path, meta)
+    _notify_restore(history)   # 重建 todos 等会话状态（钩子在 agent.py 注册）
     _loaded = (meta, history)
     return history
 
@@ -371,6 +396,7 @@ def handle_slash(cmd: str, history: list) -> bool:
         old = _current["path"].stem if _current else None
         history[:] = []
         _current = None   # 下一轮结束时懒创建新文件，旧存档原样保留
+        _notify_restore(None)   # 清掉上一段会话的 todos，避免残留误导新任务
         _divider(f"新会话（旧会话已存档：{old}）" if old else "新会话")
         _end_divider()
         return True
@@ -388,6 +414,7 @@ def handle_slash(cmd: str, history: list) -> bool:
         print(f"\033[33m[session] 存档有 {meta['_bad_lines']} 行损坏，已跳过\033[0m")
     _adopt(path, meta)
     history[:] = messages   # 原地替换：REPL 其余逻辑零改动
+    _notify_restore(messages)   # 重建 todos 等会话状态
     _announce(meta, messages)
     replay(messages, _replay_turns())
     return True

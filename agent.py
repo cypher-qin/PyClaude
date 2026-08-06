@@ -47,6 +47,13 @@ if os.name == "nt":
             _stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
+    # 管道/脚本喂入的输入同样按 UTF-8 解码：否则 GBK 误读会产生代理字符，
+    # 一路带进 json 落盘时炸 UnicodeEncodeError（交互控制台走 WinConsoleIO
+    # 不受影响；errors=replace 保证任何输入都不会崩）。
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     import readline  # noqa: F401  (Unix 下让输入行支持编辑；Windows 无此模块)
@@ -66,13 +73,14 @@ from memory_integration import (bind_runtime, init_memory, inject_memories,
                                 start_prefetch)
 from session_integration import (handle_slash, replay_loaded, save_session,
                                  session_banner_text, session_entry,
-                                 session_usage_lines)
-from status_report import STATS, Spinner
+                                 session_usage_lines, set_restore_hook)
+from status_report import STATS, Spinner, fmt_tokens, reload_budget_config
 from task_integration import task_count, task_system_prompt, task_tools
 from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
                               plan_notify_todos, plan_turn_start)
-from background_integration import (bg_bind, bg_collect, bg_enabled, bg_shutdown,
-                                    bg_start, bg_system_prompt, bg_tools)
+from background_integration import (bg_bind, bg_collect, bg_enabled,
+                                    bg_reload_cap, bg_shutdown, bg_start,
+                                    bg_system_prompt, bg_tools)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -90,6 +98,9 @@ _CLI_OVERRIDES = {k: v for k, v in os.environ.items()
                   if k.startswith(("MCP_", "SESSION_", "BG_"))}
 load_dotenv(override=True)
 os.environ.update(_CLI_OVERRIDES)
+# 预算/缓冲上限在各自模块 import 时读过早（.env 尚未加载），这里按 .env 重读
+reload_budget_config()
+bg_reload_cap()
 
 # 用第三方 base_url 时，清掉可能残留的 ANTHROPIC_AUTH_TOKEN，避免鉴权串味
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -111,7 +122,7 @@ MAX_RETRIES = 3
 MAX_CONSECUTIVE_529 = 2
 MAX_RECOVERY_RETRIES = 2
 BASE_DELAY_MS = 500
-CONTEXT_LIMIT = 50000          # messages 序列化字节数超过此值触发摘要压缩
+CONTEXT_LIMIT = 100000          # messages 序列化字节数超过此值触发摘要压缩
 KEEP_RECENT_TOOL_RESULTS = 3   # micro_compact 保留最近几条完整 tool_result
 SUMMARY_MAX_TOKENS = 2000      # 压缩摘要预算（关 thinking 后实测只用 ~262）
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
@@ -164,18 +175,29 @@ def _decode_console(raw: bytes) -> str:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # 注意：capture_output 拿字节再手动解码，避免 text=True 在中文 Windows 用 GBK
+    # 注意：拿字节再手动解码，避免 text=True 在中文 Windows 用 GBK
     # 解码非 GBK 输出时崩溃（会让 stdout 变 None 触发 None+str）。
     # run_in_background 仅为 schema 兼容而接收：后台派发在 agent_loop 里拦截
     # （bg_start），走到这里说明子系统关闭或是子代理调用 → 前台执行。
+    # 显式 Popen 而非 subprocess.run：用户 Ctrl+C 时先杀掉子进程树再抛异常，
+    # 不留孤儿 cmd（run 阻塞在 communicate 里时外面够不到 proc 句柄）。
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, timeout=120)
-        raw = (r.stdout or b"") + (r.stderr or b"")
+        proc = subprocess.Popen(command, shell=True, cwd=WORKDIR,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return "Error: Timeout (120s)"
+        except KeyboardInterrupt:
+            proc.kill()
+            proc.wait()
+            raise
+        raw = (stdout or b"") + (stderr or b"")
         out = _decode_console(raw).strip()
         return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
@@ -299,6 +321,41 @@ def run_todo_write(todos: list) -> str:
     # 返回完整清单 = 每次调用顺带完成一次「计划背诵」，对抗长任务的上下文漂移
     return (f"Updated {len(CURRENT_TODOS)} todos ({done} completed).\n{lines}\n"
             "Keep exactly one in_progress; update statuses as you work.")
+
+
+def _block_field(block, name):
+    """块字段统一读取：历史里 SDK 对象与 wire-format dict 两种形态共存。"""
+    if isinstance(block, dict):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def restore_todos_from_history(history: list | None) -> None:
+    """会话恢复（-c/-r//resume）后从历史重建 CURRENT_TODOS；/new 传 None 清空。
+
+    倒序找最近一次 todo_write 的 tool_use 输入。找不到则置空——避免上一段
+    会话的清单残留误导新任务（todos 本体只活在内存里，消息历史是它的唯一存档）。
+    """
+    global CURRENT_TODOS
+    todos: list[dict] = []
+    for msg in reversed(history or []):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        hit = None
+        for block in content:
+            if (_block_field(block, "type") == "tool_use"
+                    and _block_field(block, "name") == "todo_write"):
+                hit = _block_field(block, "input") or {}
+                break
+        if hit is not None:
+            normalized, error = _normalize_todos(hit.get("todos"))
+            todos = normalized if not error else []
+            break
+    CURRENT_TODOS = todos
+    plan_notify_todos(CURRENT_TODOS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -524,6 +581,11 @@ def spawn_subagent(description: str, *, system: str = SUB_SYSTEM,
     pool = handlers if handlers is not None else BUILTIN_HANDLERS
     messages = [{"role": "user", "content": description}]
     for _ in range(max_turns):
+        if STATS.budget_exceeded():
+            # 预算门同样管子代理：最多 30 轮的调用循环不能绕过任务预算
+            messages.append({"role": "assistant", "content":
+                             "[Token 预算已达上限，子代理提前结束]"})
+            break
         response = client.messages.create(
             model=MODEL, system=system, messages=messages,
             tools=sub_tools, max_tokens=8000)
@@ -906,6 +968,41 @@ def call_llm(messages: list, state: RecoveryState, max_tokens: int):
     return response
 
 
+# 预算门哨兵：agent_loop 因 token 预算逼近而暂停时返回它，REPL 侧弹确认门。
+# 用对象哨兵而非异常——暂停是正常流程不是错误。
+PAUSE_BUDGET = object()
+
+
+def _render_todos() -> str:
+    marks = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
+    lines = [f"{marks.get(t.get('status'), '[ ]')} {t.get('content', '')}"
+             for t in CURRENT_TODOS]
+    return "\n".join(lines) if lines else "（未建立 todo 清单）"
+
+
+def budget_pause_message(messages: list, snapshot: list) -> None:
+    """预算逼近上限：往历史追加「进度总结 + 是否继续」，确认交给 REPL 侧。
+
+    摘要全部复用现有件：session_compact_summary()（会话记忆，免费）优先，
+    否则 summarize_history() 旁路一次（实测 ~262 token）；两者都失败就只报
+    todo 清单与用量数字——暂停本身不能因摘要失败而失败。
+    """
+    total, granted = STATS.session_total(), STATS.budget_granted
+    summary = None
+    try:
+        summary = session_compact_summary() or summarize_history(snapshot)
+    except Exception:
+        summary = None
+    parts = [f"⚠ Token 预算即将耗尽：累计 {fmt_tokens(total)} / 本档授权 "
+             f"{fmt_tokens(granted)}（{STATS.budget_pct()}%），任务尚未完成。",
+             f"当前进度清单：\n{_render_todos()}"]
+    if summary:
+        parts.append("进度摘要：\n" + str(summary).strip())
+    parts.append("是否继续该任务？请用户确认（REPL 将等待 y/N）。")
+    messages.append({"role": "assistant", "content": [
+        {"type": "text", "text": "\n\n".join(parts)}]})
+
+
 def agent_loop(messages: list):
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
@@ -915,6 +1012,14 @@ def agent_loop(messages: list):
     while True:
         snapshot = list(messages)   # 压缩前快照：提炼记忆要看没被打码的对话
         prepare_context(messages)
+
+        # 预算门：累计 token 逼近本档授权（≥90%）且任务仍在推进（还在工具
+        # 循环里）时暂停，把续跑决定权交回用户。任务已完成时模型不发
+        # tool_use、循环自然结束，不会走到这里——不会误拦。
+        if STATS.budget_exceeded():
+            budget_pause_message(messages, snapshot)
+            save_session(messages)
+            return PAUSE_BUDGET
 
         # 后台任务完成通知：持久化进历史（是数据不是提醒），作为独立 user 消息。
         # 本轮工具执行期间/上一轮结束后（input() 空闲窗口）完成的任务都在这里送达。
@@ -934,6 +1039,7 @@ def agent_loop(messages: list):
                 continue
             messages.append({"role": "assistant", "content": [
                 {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
+            save_session(messages)   # 增量落盘：错误收尾也留档
             return
 
         # 输出被 max_tokens 截断：先升配重试一次，再尝试续写
@@ -944,6 +1050,7 @@ def agent_loop(messages: list):
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
                 continue
             messages.append({"role": "assistant", "content": response.content})
+            save_session(messages)   # 增量落盘：手动终止最多丢进行中的半轮
             if state.recovery_count < MAX_RECOVERY_RETRIES:
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
@@ -953,6 +1060,7 @@ def agent_loop(messages: list):
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
+        save_session(messages)   # 增量落盘：手动终止最多丢进行中的半轮
 
         # 没有 tool_use → 本轮结束
         if not has_tool_use(response.content):
@@ -990,7 +1098,10 @@ def agent_loop(messages: list):
                 output = call_tool_handler(HANDLERS.get(block.name),
                                            block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
-            print(str(output)[:300])
+            # 显示尾部而非头部：最新进展总在尾部。从头截会让长跑后台任务的
+            # 控制台永远停在首行，制造"卡死"错觉（8-6 复盘教训）。
+            # 模型拿到的仍是完整 tool_result，这里只影响人看到的。
+            print(str(output)[-300:])
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": output})
 
@@ -999,6 +1110,7 @@ def agent_loop(messages: list):
         # 搭车注入：本轮工具执行期间完成的后台任务，随 tool_result 一起送回
         results.extend({"type": "text", "text": n} for n in bg_collect())
         messages.append({"role": "user", "content": results})
+        save_session(messages)   # 增量落盘：手动终止最多丢进行中的半轮
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1064,11 +1176,76 @@ def print_banner():
     print()
 
 
+def run_turn(history: list, query: str) -> None:
+    """执行一个用户轮次：hooks → agent_loop（含中断处理与预算确认门）→ 结算。
+
+    从 REPL 循环里提出来，一是主循环只剩输入分发，二是中断/预算路径可以
+    脱离控制台直接测试（异步注入 KeyboardInterrupt 即可模拟 Ctrl+C）。
+    """
+    trigger_hooks("UserPromptSubmit", query)
+    turn_start = len(history)
+    history.append({"role": "user", "content": query})
+    try:
+        result = agent_loop(history)
+    except KeyboardInterrupt:
+        # 轮中 Ctrl+C：取消本轮但不杀会话。消息已增量落盘，这里再
+        # 兜底存一次，然后回到输入循环（一次 ^C = 取消，两次 ^C 才走
+        # 提示符处的退出分支）
+        save_session(history)
+        print("\n  \033[33m[已中断] 本轮已取消，记录已保存。"
+              "可继续输入，或 q 退出。\033[0m")
+        STATS.reset_turn()
+        print()
+        return
+    # 预算确认门：agent_loop 因预算暂停时，把续跑决定权交回用户
+    while result is PAUSE_BUDGET:
+        try:
+            ans = input(f"  \033[33m⚠ Token 预算即将耗尽"
+                        f"（{fmt_tokens(STATS.session_total())}/"
+                        f"{fmt_tokens(STATS.budget_granted)}），"
+                        f"继续任务? [y/N]\033[0m ")
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans.strip().lower() in ("y", "yes", "继续", "是"):
+            granted = STATS.extend_budget()
+            print(f"  \033[36m[预算] 已追加至 {fmt_tokens(granted)} tokens\033[0m")
+            history.append({"role": "user", "content":
+                            f"[用户确认继续任务，预算已追加至 {granted} tokens]"})
+            try:
+                result = agent_loop(history)
+            except KeyboardInterrupt:
+                save_session(history)
+                print("\n  \033[33m[已中断] 本轮已取消，记录已保存。\033[0m")
+                result = None
+        else:
+            # 拒绝续跑 = 结束该任务。自动追加一档预算额度：预算是
+            # 「单次任务」概念，不追加的话下一轮新任务起步就会再次
+            # 被预算门拦下（累计用量仍在旧档的 90% 之上）
+            STATS.extend_budget()
+            print("  \033[90m[预算] 任务已暂停，后续对话已放开新预算档。\033[0m")
+            break
+    save_session(history)   # 轮边界落盘：快照重写当前存档
+    # 打印本轮模型的文字回复
+    for msg in history[turn_start:]:
+        if msg.get("role") == "assistant":
+            for block in msg.get("content", []):
+                if block_type(block) == "text":
+                    text = block["text"] if isinstance(block, dict) else block.text
+                    print(f"\033[32m{text}\033[0m")
+    line = STATS.turn_line()            # P0：本轮结算
+    if line:
+        print(f"  \033[90m{line}\033[0m")
+    STATS.reset_turn()
+    print()
+
+
 if __name__ == "__main__":
     # 先做记忆自检（迁移旧格式 + 重建索引），再连 MCP（子进程 + 握手 + tools/list），
     # 再处理会话恢复（-c/-r/--list），最后打印 banner——banner 里的数目才是准的
     init_memory()
     assemble_tool_pool()
+    # 会话恢复钩子：-c/-r//resume 时从历史重建 todos，/new 时清空
+    set_restore_hook(restore_todos_from_history)
     history = session_entry()       # 无参数时返回 []，即新会话
     print_banner()
     replay_loaded()                 # 刚恢复：分隔带 + 最近 N 轮回放；否则无输出
@@ -1077,8 +1254,12 @@ if __name__ == "__main__":
         while True:
             # P2：提示符带上下文占用（本地序列化预算口径，非模型真实窗口）
             ctx_pct = min(100, round(100 * estimate_size(history) / CONTEXT_LIMIT))
+            STATS.flush_pending()   # 冲刷后台线程攒下的用量报告，别和输入行撕扯
+            tok = (f" · {fmt_tokens(STATS.session_total())}/"
+                   f"{fmt_tokens(STATS.budget_granted)} tok"
+                   if STATS.budget_granted > 0 else "")
             try:
-                query = input(f"\033[36m[{datetime.now():%H:%M} · {ctx_pct}% ctx] myagent >> \033[0m")
+                query = input(f"\033[36m[{datetime.now():%H:%M} · {ctx_pct}% ctx{tok}] myagent >> \033[0m")
             except (EOFError, KeyboardInterrupt):
                 break
             # 管道/重定向输入的首行可能带 BOM（PowerShell 管道必带）：
@@ -1091,24 +1272,10 @@ if __name__ == "__main__":
                 if not handle_slash(query.strip(), history):
                     print("  \033[90m未知命令，可用：/resume /new /sessions\033[0m")
                 continue
-            trigger_hooks("UserPromptSubmit", query)
-            turn_start = len(history)
-            history.append({"role": "user", "content": query})
-            agent_loop(history)
-            save_session(history)   # 轮边界落盘：快照重写当前存档
-            # 打印本轮模型的文字回复
-            for msg in history[turn_start:]:
-                if msg.get("role") == "assistant":
-                    for block in msg.get("content", []):
-                        if block_type(block) == "text":
-                            text = block["text"] if isinstance(block, dict) else block.text
-                            print(f"\033[32m{text}\033[0m")
-            line = STATS.turn_line()            # P0：本轮结算
-            if line:
-                print(f"  \033[90m{line}\033[0m")
-            STATS.reset_turn()
-            print()
+            run_turn(history, query)
     finally:
+        # 兜底落盘：无论正常退出还是异常路径，记录都完整在盘
+        save_session(history)
         # 退出时先杀后台任务（shell=True 子进程不会随 daemon 线程死，须杀进程树），
         # 再关 MCP server 子进程，别留孤儿进程
         bg_shutdown()

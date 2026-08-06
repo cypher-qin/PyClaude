@@ -28,9 +28,12 @@ import threading
 import time
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
-OUTPUT_CAP_BYTES = 400_000   # 每任务原始字节缓冲上限（保尾部，防日志撑爆内存）
+# 每任务原始字节缓冲上限（保尾部，防日志撑爆内存）。bg_output 默认全量返回，
+# 上限放宽到 2MB；可用 BG_OUTPUT_CAP 环境变量覆盖。超出仍保尾弃头，
+# trimmed 标记会在输出头部提示。
+OUTPUT_CAP_BYTES = max(50_000, int(float(os.getenv("BG_OUTPUT_CAP") or "2000000")))
 NOTIFY_TAIL_CHARS = 500      # 完成通知里携带的输出尾部字符数
-DEFAULT_OUTPUT_TAIL = 20_000 # bg_output 默认返回的尾部字符数
+DEFAULT_OUTPUT_TAIL = 0      # bg_output 默认返回全量缓冲（0 = 不截断）
 _READ_CHUNK = 4096
 
 _CWD = os.getcwd()           # 等价 agent.WORKDIR（进程启动目录），避免反向 import
@@ -46,6 +49,17 @@ _COUNTER = 0
 
 # 解码函数由 agent 通过 bg_bind 注入（默认 utf-8/replace，离线可独立 import）
 _decode = lambda raw: raw.decode("utf-8", errors="replace")
+
+
+def bg_reload_cap() -> None:
+    """重读 BG_OUTPUT_CAP。agent.py 在 load_dotenv 之后调用——
+    本模块 import 时 .env 尚未加载，常量只吃得到 shell 环境变量。"""
+    global OUTPUT_CAP_BYTES
+    try:
+        OUTPUT_CAP_BYTES = max(50_000,
+                               int(float(os.getenv("BG_OUTPUT_CAP") or "2000000")))
+    except ValueError:
+        pass
 
 
 def bg_bind(*, decode) -> None:
@@ -242,8 +256,7 @@ def _format_notification(s: dict) -> str:
            f"  <summary>{summary}</summary>\n"
            "</task_notification>")
     if len(output) > NOTIFY_TAIL_CHARS:
-        xml += (f"\n(use bg_output(task_id=\"{s['id']}\") for up to the last "
-                f"{DEFAULT_OUTPUT_TAIL} chars of output)")
+        xml += (f"\n(use bg_output(task_id=\"{s['id']}\") for the full output)")
     return xml
 
 
@@ -322,7 +335,7 @@ def _run_bg_output(task_id: str = "", tail: int = DEFAULT_OUTPUT_TAIL) -> str:
             trimmed = t["trimmed"]
             raw = bytes(t["buf"])          # 锁内拷贝，锁外解码
         try:
-            tail = max(200, int(tail))
+            tail = int(tail)
         except (TypeError, ValueError):
             tail = DEFAULT_OUTPUT_TAIL
         text = _decode(raw)
@@ -335,7 +348,10 @@ def _run_bg_output(task_id: str = "", tail: int = DEFAULT_OUTPUT_TAIL) -> str:
             header += " · (still running)"
         if trimmed:
             header += f" · [output trimmed to last {OUTPUT_CAP_BYTES // 1024}KB]"
-        shown = text[-tail:]
+        # tail ≤ 0 = 全量返回（默认）；显式正数才按尾部截断（最少 200 字符）。
+        # 注意：全量输出会整体进模型上下文，超长日志由 CONTEXT_LIMIT 压缩管线
+        # 与任务预算门兜底。
+        shown = text if tail <= 0 else text[-max(200, tail):]
         return header + "\n" + (shown if shown.strip() else "(no output)")
     except Exception as e:
         return f"Error: {e}"
@@ -364,12 +380,16 @@ _BG_LIST = {"name": "bg_list",
             "description": "List background tasks: id, status, elapsed, command.",
             "input_schema": {"type": "object", "properties": {}, "required": []}}
 _BG_OUTPUT = {"name": "bg_output",
-              "description": "Read recent output of a background task (works "
-                             "while it is still running).",
+              "description": "Read output of a background task — the FULL "
+                             "buffered output by default (works while it is "
+                             "still running). Pass tail>0 to limit to the "
+                             "last N chars.",
               "input_schema": {"type": "object",
                                "properties": {"task_id": {"type": "string"},
                                               "tail": {"type": "integer",
-                                                       "description": "chars of "
+                                                       "description": "omit or "
+                                                       "0 = full output; "
+                                                       "positive = chars of "
                                                        "tail to return"}},
                                "required": ["task_id"]}}
 _BG_KILL = {"name": "bg_kill",
