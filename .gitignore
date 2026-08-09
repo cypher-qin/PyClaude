@@ -8,6 +8,7 @@
 .tasks/
 .mailboxes/
 .task_outputs/
+.tmp/
 
 # python
 __pycache__/

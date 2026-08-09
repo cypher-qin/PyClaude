@@ -79,7 +79,8 @@ from task_integration import task_count, task_system_prompt, task_tools
 from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
                               plan_notify_todos, plan_turn_start)
 from background_integration import (bg_bind, bg_collect, bg_enabled,
-                                    bg_reload_cap, bg_shutdown, bg_start,
+                                    bg_handle_slash, bg_reload_cap,
+                                    bg_shutdown, bg_start, bg_status_card,
                                     bg_system_prompt, bg_tools)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -848,7 +849,16 @@ BUILTIN_TOOLS = [
                                                 "returns a task id immediately and a "
                                                 "<task_notification> arrives on "
                                                 "completion. Only for long-running "
-                                                "commands."}},
+                                                "commands."},
+                          "yields_turn": {"type": "boolean",
+                                          "description": "Only meaningful with "
+                                          "run_in_background=true. true = later "
+                                          "work DEPENDS on this task's result: "
+                                          "the current turn ends right after "
+                                          "launch, control returns to the user, "
+                                          "and the notification arrives with the "
+                                          "user's next input. false/unset = keep "
+                                          "working on other things."}},
                       "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents (optionally a slice).",
      "input_schema": {"type": "object",
@@ -972,6 +982,10 @@ def call_llm(messages: list, state: RecoveryState, max_tokens: int):
 # 用对象哨兵而非异常——暂停是正常流程不是错误。
 PAUSE_BUDGET = object()
 
+# 后台任务交接哨兵：模型以 yields_turn=true 启动了阻塞型后台任务时返回它，
+# run_turn 打印交接卡后把控制权还给用户——杜绝 sleep/bg_output 忙等轮询。
+YIELD_BG = object()
+
 
 def _render_todos() -> str:
     marks = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
@@ -1070,6 +1084,7 @@ def agent_loop(messages: list):
 
         results = []
         compacted_now = False
+        yield_requested = False
         for block in response.content:
             if block.type != "tool_use":
                 continue
@@ -1094,6 +1109,9 @@ def agent_loop(messages: list):
                     and bg_enabled()):
                 # 慢命令丢后台：立即回占位文本，完成后以 <task_notification> 通知
                 output = bg_start(block.input.get("command", ""))
+                # yields_turn：该任务阻塞后续工作 → 本批工具跑完即交还控制权
+                if block.input.get("yields_turn"):
+                    yield_requested = True
             else:
                 output = call_tool_handler(HANDLERS.get(block.name),
                                            block.input, block.name)
@@ -1111,6 +1129,10 @@ def agent_loop(messages: list):
         results.extend({"type": "text", "text": n} for n in bg_collect())
         messages.append({"role": "user", "content": results})
         save_session(messages)   # 增量落盘：手动终止最多丢进行中的半轮
+        # 阻塞型后台任务已启动：立即结束本轮、把控制权还给用户。
+        # 完成通知随用户下一次输入送达——模型没有机会进入忙等轮询。
+        if yield_requested:
+            return YIELD_BG
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1170,10 +1192,21 @@ def print_banner():
     for label, value in rows:
         print(f"  \033[1;36m{label}\033[0m  \033[37m{value}\033[0m")
     print(f"\n  \033[90m回车发送 · q 退出 · 让我 compact 可压缩上下文 · "
-          f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认\033[0m")
+          f"read/glob/grep 可读整机 · write/edit 出工作区会请你确认 · "
+          f"/bg 管理后台任务\033[0m")
     for _line in session_usage_lines():   # 会话命令速查（禁用时是一行禁用说明）
         print(f"  \033[90m{_line}\033[0m")
     print()
+
+
+def _print_turn_texts(history: list, turn_start: int) -> None:
+    """打印本轮模型的文字回复（含与 tool_use 共存的 text 块）。"""
+    for msg in history[turn_start:]:
+        if msg.get("role") == "assistant":
+            for block in msg.get("content", []):
+                if block_type(block) == "text":
+                    text = block["text"] if isinstance(block, dict) else block.text
+                    print(f"\033[32m{text}\033[0m")
 
 
 def run_turn(history: list, query: str) -> None:
@@ -1224,14 +1257,28 @@ def run_turn(history: list, query: str) -> None:
             STATS.extend_budget()
             print("  \033[90m[预算] 任务已暂停，后续对话已放开新预算档。\033[0m")
             break
+    # 阻塞型后台任务交接：打印交接卡，立即把控制权还给用户（类似 Claude Code）。
+    # 进度总结由模型写在同响应 text 块里，这里先把它打出来。
+    if result is YIELD_BG:
+        save_session(history)
+        _print_turn_texts(history, turn_start)
+        print("  \033[36m[交接] 阻塞型后台任务已启动，控制权已交还：\033[0m")
+        if CURRENT_TODOS:
+            print(_render_todos())
+        card = bg_status_card()
+        if card:
+            print(card)
+        print("  \033[90m任务完成会自动通知（随您的下一次输入送达）；"
+              "可继续输入其他指令，/bg 查看与管理后台任务。\033[0m")
+        line = STATS.turn_line()
+        if line:
+            print(f"  \033[90m{line}\033[0m")
+        STATS.reset_turn()
+        print()
+        return
     save_session(history)   # 轮边界落盘：快照重写当前存档
     # 打印本轮模型的文字回复
-    for msg in history[turn_start:]:
-        if msg.get("role") == "assistant":
-            for block in msg.get("content", []):
-                if block_type(block) == "text":
-                    text = block["text"] if isinstance(block, dict) else block.text
-                    print(f"\033[32m{text}\033[0m")
+    _print_turn_texts(history, turn_start)
     line = STATS.turn_line()            # P0：本轮结算
     if line:
         print(f"  \033[90m{line}\033[0m")
@@ -1268,9 +1315,14 @@ if __name__ == "__main__":
             if query.strip().lower() in ("q", "exit", "quit", ""):
                 break
             if query.strip().startswith("/"):
+                q = query.strip()
+                # /bg 命令族：后台任务查看/日志/终止，不经过会话子系统
+                if q.split()[0].lower() == "/bg":
+                    bg_handle_slash(q)
+                    continue
                 # 斜杠命令（/resume /new /sessions）在轮边界处理，不进模型
-                if not handle_slash(query.strip(), history):
-                    print("  \033[90m未知命令，可用：/resume /new /sessions\033[0m")
+                if not handle_slash(q, history):
+                    print("  \033[90m未知命令，可用：/resume /new /sessions /bg\033[0m")
                 continue
             run_turn(history, query)
     finally:
