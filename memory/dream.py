@@ -73,11 +73,20 @@ def should_dream() -> tuple[bool, str]:
 
 def dream(fork_agent) -> str:
     """整理一次。fork_agent(description, system=, max_turns=) -> str。"""
+    start = last_consolidated_at()      # 本次整理开始前的时间点（上次整理时间，首次为 0）
     _touch_lock()                       # 取锁：把 mtime 刷成现在，挡住并发的第二个进程
     try:
-        return fork_agent(_catalog(), system=_SYSTEM, max_turns=MAX_TURNS)
+        result = fork_agent(_catalog(), system=_SYSTEM, max_turns=MAX_TURNS)
     finally:
         _touch_lock()                   # 完成时间即下一次的 lastConsolidatedAt
+    # 整理完成：顺手清会话记忆目录（LRU 按数量保留）。门控④的 sessions_since
+    # 数的是 lastConsolidatedAt 之后的新会话，这里 before 传入本次整理的开始
+    # 时间——只清比它更早的文件，不删本次门控周期内的新会话，计数不受影响。
+    try:
+        session.cleanup_old_sessions(before=start)
+    except Exception:
+        pass
+    return result
 
 
 def _touch_lock() -> None:

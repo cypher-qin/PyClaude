@@ -34,7 +34,7 @@ from pathlib import Path
 # 上限放宽到 2MB；可用 BG_OUTPUT_CAP 环境变量覆盖。超出仍保尾弃头，
 # trimmed 标记会在输出头部提示。
 OUTPUT_CAP_BYTES = max(50_000, int(float(os.getenv("BG_OUTPUT_CAP") or "2000000")))
-NOTIFY_TAIL_CHARS = 500      # 完成通知里携带的输出尾部字符数
+NOTIFY_TAIL_CHARS = max(200, int(float(os.getenv("BG_NOTIFY_TAIL") or "500")))  # 完成通知里携带的输出尾部字符数
 DEFAULT_OUTPUT_TAIL = 0      # bg_output 默认返回全量缓冲（0 = 不截断）
 _READ_CHUNK = 4096
 LOG_CAP_BYTES = 10_000_000   # 单个日志文件上限：超限停写并留标记（文件不做保尾重写，内存缓冲仍保尾，二者互补）
@@ -54,6 +54,45 @@ _COUNTER = 0
 
 # 解码函数由 agent 通过 bg_bind 注入（默认 utf-8/replace，离线可独立 import）
 _decode = lambda raw: raw.decode("utf-8", errors="replace")
+
+
+# 完成通知里 output 摘要过长时，同样落盘只留头尾预览（与 agent 的
+# persist_large_output 同款，这里自带一份避免反向 import agent.py）。
+# 落盘目录与 agent 共用 .task_outputs/，由 agent 的 prepare_context 统一清理。
+# 阈值保持与 agent.py 的 PERSIST_THRESHOLD / PERSIST_PREVIEW 一致，改动时两边同改。
+_PERSIST_THRESHOLD = 5000
+_PERSIST_PREVIEW = 500
+_RESULT_DIR = Path(_CWD) / ".task_outputs"
+
+
+def bg_reload_notify_tail() -> None:
+    """重读 BG_NOTIFY_TAIL。agent.py 在 load_dotenv 之后调用——
+    本模块 import 时 .env 尚未加载，模块级常量只吃得到 shell 环境变量。"""
+    global NOTIFY_TAIL_CHARS
+    try:
+        NOTIFY_TAIL_CHARS = max(200, int(float(os.getenv("BG_NOTIFY_TAIL") or "500")))
+    except (TypeError, ValueError):
+        pass
+
+
+def _persist_output(output: str, name: str) -> str:
+    """超长 output → 落盘 .task_outputs/，返回头尾预览 + 路径；失败回退原文。"""
+    if len(output) <= _PERSIST_THRESHOLD:
+        return output
+    try:
+        _RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        path = _RESULT_DIR / f"{name}-{int(time.time())}.txt"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(output, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        return output
+    head, tail = output[:_PERSIST_PREVIEW], output[-_PERSIST_PREVIEW:]
+    return (f"<persisted-output>\nFull output: {path} "
+            f"({len(output)} chars) — read_file to see it all.\n"
+            f"Preview (head {_PERSIST_PREVIEW} + tail {_PERSIST_PREVIEW} chars):\n"
+            f"{head}\n…[中间省略 {len(output) - 2 * _PERSIST_PREVIEW} 字符]…\n"
+            f"{tail}\n</persisted-output>")
 
 
 def bg_reload_cap() -> None:
@@ -346,6 +385,9 @@ def bg_collect() -> list[str]:
                     "output": _decode(bytes(t["buf"])),
                 })
         for s in snapshots:
+            # 通知内容同样过一道大输出落盘：完成通知是发给模型的（进上下文），
+            # 尾部 500 字的 output 摘要被 persist 收窄成头尾预览 + 全文路径
+            s["output"] = _persist_output(s["output"], f"bg_{s['id']}")
             notifications.append(_format_notification(s))
     except Exception:
         return []

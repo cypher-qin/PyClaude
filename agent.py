@@ -80,8 +80,9 @@ from plan_integration import (inject_plan, plan_guidance, plan_note_tool,
                               plan_notify_todos, plan_turn_start)
 from background_integration import (bg_bind, bg_collect, bg_enabled,
                                     bg_handle_slash, bg_reload_cap,
-                                    bg_shutdown, bg_start, bg_status_card,
-                                    bg_system_prompt, bg_tools)
+                                    bg_reload_notify_tail, bg_shutdown,
+                                    bg_start, bg_status_card, bg_system_prompt,
+                                    bg_tools)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  配置 —— 接入私有 API 的唯一入口（改这里 / 改 .env 即可换模型）
@@ -102,6 +103,92 @@ os.environ.update(_CLI_OVERRIDES)
 # 预算/缓冲上限在各自模块 import 时读过早（.env 尚未加载），这里按 .env 重读
 reload_budget_config()
 bg_reload_cap()
+bg_reload_notify_tail()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Prompt Cache 探针 —— 探测端点是否真的实现 prompt cache，再决定挂不挂断点
+#
+#  背景：prompt cache 是「显式 opt-in」的——不挂 cache_control 服务端就不建缓存。
+#  但「兼容 Anthropic 格式」≠「实现了缓存」：第三方网关可能忽略该字段、
+#  可能缓存了仍按全价计费、可能有各自的最低可缓存前缀（静默不缓存）。
+#  所以盲目挂断点可能：① 无效（厂商忽略）② 多付写缓存价（1.25×）③ 与厂商
+#  已自动缓存的策略冲突。对策是启动时发一次探针请求实测，按结果决定。
+#
+#  机制：用「真实请求的前缀」（assemble_system_prompt() + TOOLS）发两条带
+#  cache_control 的相同请求 → 读第二次的 usage.cache_read_input_tokens：
+#      > 0       厂商真实现且打折 → 保留断点（PROMPT_CACHE_ENABLED=True）
+#      == 0      厂商忽略/前缀不够 → 去掉断点（回退全价，不付写缓存钱）
+#      抛异常    厂商不认识该参数 → 去掉断点
+#  用真实前缀而不是短占位符：太短达不到端点最低可缓存前缀，cache_read 恒为 0
+#  会误判「未命中」。代价是探针要付约一个真实 system+tools 的写+读成本
+#  （几 K token，可忽略），换来判定可靠。可被 PROMPT_CACHE_PROBE=0 关闭。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 运行时状态：是否在 system/tools 前缀上挂 cache_control 断点
+PROMPT_CACHE_ENABLED = False
+# 强制开关（跳过探针）：PROMPT_CACHE_PROBE=1 强制开（不发探针），0 强制关
+_PROBE_FORCE = (os.getenv("PROMPT_CACHE_PROBE") or "").strip().lower()
+
+
+def probe_prompt_cache() -> None:
+    """启动时探测端点是否实现 prompt cache，据此设置 PROMPT_CACHE_ENABLED。
+
+    在 assemble_tool_pool() 之后调用（TOOLS 已就位），banner 之前。
+    """
+    global PROMPT_CACHE_ENABLED
+    if _PROBE_FORCE in ("1", "on", "true", "yes"):
+        PROMPT_CACHE_ENABLED = True
+        print("  \033[90m[prompt-cache] 强制开启（PROMPT_CACHE_PROBE=1，跳过探针）\033[0m")
+        return
+    if _PROBE_FORCE in ("0", "off", "false", "no"):
+        PROMPT_CACHE_ENABLED = False
+        print("  \033[90m[prompt-cache] 已关闭（PROMPT_CACHE_PROBE=0）\033[0m")
+        return
+    try:
+        cached = _probe_cached_reads()
+    except Exception as e:
+        print(f"  \033[90m[prompt-cache] 探针失败（{type(e).__name__}: {e}），已关闭\033[0m")
+        return
+    if cached and cached > 0:
+        PROMPT_CACHE_ENABLED = True
+        print(f"  \033[32m[prompt-cache] 端点支持缓存（第二次调用命中 {cached} token）"
+              f"，已挂断点\033[0m")
+    else:
+        print("  \033[90m[prompt-cache] 端点未命中缓存（忽略/前缀不足/全价），"
+              "已关闭断点\033[0m")
+
+
+def _probe_cached_reads() -> int:
+    """发两次相同的带 cache_control 的真实前缀请求，返回第二次的 cache_read token。
+
+    用真实的 assemble_system_prompt() 而非短占位符——探针的 system 若太短
+    达不到端点最低可缓存前缀，cache_read 恒为 0 会误判「未命中」。同时带上
+    tools=TOOLS：真实请求的断点缓存的是「tools + system」整体前缀（tools
+    渲染在 system 之前），探针必须测同一个前缀才算数。
+    """
+    system = [{"type": "text", "text": assemble_system_prompt(),
+               "cache_control": {"type": "ephemeral"}}]
+    msg = [{"role": "user", "content": "ping"}]
+    kwargs = dict(model=MODEL, system=system, messages=msg,
+                  tools=TOOLS, max_tokens=4)
+    # 第一次：写缓存（usage.cache_creation 应 > 0，若有缓存）
+    client.messages.create(**kwargs)
+    # 第二次：应读缓存（真实请求同样的 tools+system 前缀）
+    resp = client.messages.create(**kwargs)
+    return int(getattr(resp.usage, "cache_read_input_tokens", 0) or 0)
+
+
+def system_for_llm() -> list | str:
+    """给 call_llm 的 system：探针确认端点支持缓存时，把 system 挂上断点。
+
+    Anthropic 的缓存是前缀匹配：system 最后一个块上的断点会把 tools + system
+    一起缓存（tools 渲染在 system 之前）。system 拼装保持逐字稳定（无时间戳），
+    断点不改变内容本身，只多一个 cache_control 字段。
+    """
+    if not PROMPT_CACHE_ENABLED:
+        return assemble_system_prompt()
+    return [{"type": "text", "text": assemble_system_prompt(),
+             "cache_control": {"type": "ephemeral"}}]
 
 # 用第三方 base_url 时，清掉可能残留的 ANTHROPIC_AUTH_TOKEN，避免鉴权串味
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -125,6 +212,8 @@ MAX_RECOVERY_RETRIES = 2
 BASE_DELAY_MS = 500
 CONTEXT_LIMIT = 100000          # messages 序列化字节数超过此值触发摘要压缩
 KEEP_RECENT_TOOL_RESULTS = 3   # micro_compact 保留最近几条完整 tool_result
+PERSIST_THRESHOLD = 5000       # 单条 tool_result 字符数超此值 → 落盘只留头尾预览
+PERSIST_PREVIEW = 500          # 落盘后的预览长度：头 500 + 尾 500
 SUMMARY_MAX_TOKENS = 2000      # 压缩摘要预算（关 thinking 后实测只用 ~262）
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 PROMPT = "\033[36mmyagent >> \033[0m"
@@ -479,6 +568,12 @@ DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev
 DESTRUCTIVE = ["rm ", "rmdir", "del ", "format ", "> /etc/", "chmod 777",
                "git push", "git reset --hard"]
 
+# 全权模式开关（.env: AUTONOMOUS_MODE=1）：跳过所有「确认类」拦截——
+# 危险命令弹确认、工作区外写审核。但 DENY_LIST 硬底线无条件保留：
+# rm -rf /、shutdown、mkfs 这类毁灭性命令在任何模式下都拒绝。
+AUTONOMOUS_MODE = (os.getenv("AUTONOMOUS_MODE") or "").strip().lower() \
+    in ("1", "on", "true", "yes")
+
 
 def confirm_out_of_workspace_write(tool_name: str, target: Path, args: dict) -> bool:
     """工作区外的写/改：展示改动预览并请用户当场批准。批准返回 True。"""
@@ -509,17 +604,22 @@ def confirm_out_of_workspace_write(tool_name: str, target: Path, args: dict) -> 
 
 
 def permission_hook(block):
-    """在工具真正执行前拦截：黑名单直接拒绝，危险操作弹确认。"""
+    """在工具真正执行前拦截：黑名单直接拒绝，危险操作弹确认。
+
+    全权模式（AUTONOMOUS_MODE=1）跳过「确认类」拦截（危险命令确认、工作区外
+    写审核），但 DENY_LIST 硬底线无条件保留。
+    """
     if block.name == "bash":
         command = block.input.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 return f"Permission denied: '{pattern}' is on the deny list"
-        if any(token in command for token in DESTRUCTIVE):
-            print(f"\n\033[33m[permission] 潜在危险命令:\033[0m\n  {command}")
-            if input("  允许执行? [y/N] ").strip().lower() not in ("y", "yes"):
-                return "Permission denied by user"
-    if block.name in ("write_file", "edit_file"):
+        if not AUTONOMOUS_MODE:
+            if any(token in command for token in DESTRUCTIVE):
+                print(f"\n\033[33m[permission] 潜在危险命令:\033[0m\n  {command}")
+                if input("  允许执行? [y/N] ").strip().lower() not in ("y", "yes"):
+                    return "Permission denied by user"
+    if not AUTONOMOUS_MODE and block.name in ("write_file", "edit_file"):
         raw = block.input.get("path", "")
         try:
             target = resolve_path(raw)
@@ -565,6 +665,17 @@ def extract_text(content) -> str:
 
 def has_tool_use(content) -> bool:
     return any(getattr(b, "type", None) == "tool_use" for b in content)
+
+
+def strip_thinking(content) -> list:
+    """从 assistant 响应里剥掉 thinking 块，历史里只留 text / tool_use。
+
+    推理模型（kimi 默认先思考）的 thinking 块常比 text 长数倍，且每次请求
+    都会作为历史重新发送——是上下文里最隐蔽的大头。对**已执行完**的轮次
+    （下一轮是 user tool_result）剥掉是安全的：API 只看 text + tool_use 决定
+    下一步。续写路径（max_tokens 截断）不经过这里，thinking 保留供签名校验。
+    """
+    return [b for b in content if getattr(b, "type", None) != "thinking"]
 
 
 def spawn_subagent(description: str, *, system: str = SUB_SYSTEM,
@@ -664,6 +775,9 @@ bg_bind(decode=_decode_console)
 #  Context Compaction —— 长会话保命：先压 tool_result，再裁旧消息，最后摘要
 # ═══════════════════════════════════════════════════════════════════════════
 
+# 大工具输出的落盘目录。对应 .gitignore 已忽略的 .task_outputs/。
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs"
+
 def estimate_size(messages: list) -> int:
     return len(json.dumps(messages, default=str))
 
@@ -706,6 +820,125 @@ def micro_compact(messages: list) -> list:
         if len(str(block.get("content", ""))) > 120:
             block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
     return messages
+
+
+def persist_large_output(output: str, name: str) -> str:
+    """超长工具输出落盘，上下文只留头尾预览 + 路径。
+
+    命令输出的关键信息常集中在**尾部**（错误堆栈、最后一步结果、失败码），
+    所以预览取「头 PERSIST_PREVIEW + 尾 PERSIST_PREVIEW」，而不是从头截断——
+    前 2000 字预览会把尾部关键信息整个丢掉。模型需要全文时 read_file 路径即可。
+
+    落盘有上限阈值：单文件超 PERSIST_THRESHOLD 的 4 倍才截断（本就要压缩，
+    通常不会再读全文）；文件数超 40 删最旧（按 mtime）。纯个人工具，阈值
+    只是防失控，不做精确清理。
+    """
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+    try:
+        path = _write_persisted(output, name)
+    except Exception as e:
+        print(f"\033[33m[persist] 落盘失败（{e.__class__.__name__}: {e}），"
+              f"已回退为完整输出\033[0m")
+        return output
+    return _preview_persisted(path, output)
+
+
+def persist_large_input(output: str, name: str) -> str:
+    """超长 tool_use input 落盘，历史里只留占位 + 路径（模型需要时 read_file）。
+
+    与 persist_large_output 的不同：output 一侧返回完整预览（模型常依赖尾部），
+    而 tool_use input（write_file 的 content / edit_file 的 new_text / bash 的
+    大 heredoc）是「写给工具的内容」，模型一般不需要在上下文里反复回看——所以
+    只留「已落盘 + 路径 + 字符数」一行，不占预览空间。
+    """
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+    try:
+        path = _write_persisted(output, name)
+    except Exception as e:
+        print(f"\033[33m[persist] 入参落盘失败（{e.__class__.__name__}: {e}），"
+              f"已回退为完整内容\033[0m")
+        return output
+    return (f"<persisted-input>\nFull content: {path} "
+            f"({len(output)} chars) — read_file to see it all.\n"
+            f"</persisted-input>")
+
+
+def _shrink_large_input(block) -> None:
+    """执行完成后，把 block.input 里超长的大字段替换成占位（原地改，历史副本）。
+
+    write_file 的 content / edit_file 的 new_text 是「写给工具的内容」，模型
+    不需要在上下文里反复回看；bash 里嵌的大 heredoc 同理。执行已用原始 input
+    完成，这里只影响历史里的形态。副作用：若该 input 的字段名是子代理 handler
+    要读的，且子代理后续想用——那是子代理自己的事，这里只对主循环的历史生效。
+    """
+    try:
+        field = {"write_file": "content", "edit_file": "new_text"}.get(block.name)
+        if field and isinstance(block.input, dict):
+            raw = str(block.input.get(field, ""))
+            if len(raw) > PERSIST_THRESHOLD:
+                block.input[field] = persist_large_input(raw, "input")
+    except Exception:
+        pass
+
+
+_persist_serial = 0   # 同一秒内多次落盘的同名文件加序号，避免互相覆盖
+
+
+def _write_persisted(output: str, name: str) -> Path:
+    """落盘 + 目录治理（清临时文件、限 40 个删最旧），返回写入的路径。"""
+    global _persist_serial
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # 同目录里 .tmp 开头的临时文件也会被 glob 扫到，先清掉旧的
+    for stale in TOOL_RESULTS_DIR.glob(".tmp-*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    results = sorted(TOOL_RESULTS_DIR.glob("*.txt"),
+                     key=lambda p: p.stat().st_mtime)
+    if len(results) >= 40:
+        for old in results[:len(results) - 40 + 1]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    _persist_serial += 1
+    path = TOOL_RESULTS_DIR / f"{name}-{int(time.time())}-{_persist_serial}.txt"
+    # 先写临时文件再 os.replace：写一半崩了不留半个文件
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(output, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def _preview_persisted(path: Path, output: str) -> str:
+    """把落盘后的全文包成「头尾预览 + 路径」给模型。"""
+    head, tail = output[:PERSIST_PREVIEW], output[-PERSIST_PREVIEW:]
+    return (f"<persisted-output>\nFull output: {path} "
+            f"({len(output)} chars) — read_file to see it all.\n"
+            f"Preview (head {PERSIST_PREVIEW} + tail {PERSIST_PREVIEW} chars):\n"
+            f"{head}\n…[中间省略 {len(output) - 2 * PERSIST_PREVIEW} 字符]…\n"
+            f"{tail}\n</persisted-output>")
+
+
+def _cleanup_stale_result_files() -> None:
+    """启动时清掉上一轮进程遗留的落盘文件（路径对模型是准的，但目录要干净）。
+
+    只删本进程目录（.task_outputs/）里上一轮留下的；后台任务的日志在 .tmp/bg/，
+    由 background 子系统自己治理，不在这里碰。
+    """
+    try:
+        if not TOOL_RESULTS_DIR.is_dir():
+            return
+        for stale in TOOL_RESULTS_DIR.iterdir():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def snip_compact(messages: list, max_messages: int = 50) -> list:
@@ -776,6 +1009,7 @@ def reactive_compact(messages: list) -> list:
 
 def prepare_context(messages: list) -> list:
     """每次调用模型前，都过一遍上下文预算管线。"""
+    _cleanup_stale_result_files()
     messages[:] = snip_compact(messages)
     messages[:] = micro_compact(messages)
     if estimate_size(messages) > CONTEXT_LIMIT:
@@ -932,7 +1166,7 @@ def call_tool_handler(handler, args: dict, name: str) -> str:
     if not handler:
         return f"Unknown tool: {name}"
     try:
-        return handler(**(args or {}))
+        return persist_large_output(handler(**(args or {})), name)
     except TypeError as e:
         return f"Error: {e}"
 
@@ -971,7 +1205,7 @@ def call_llm(messages: list, state: RecoveryState, max_tokens: int):
         started = time.monotonic()
         response = with_retry(
             lambda: client.messages.create(
-                model=state.current_model, system=assemble_system_prompt(),
+                model=state.current_model, system=system_for_llm(),
                 messages=messages, tools=TOOLS, max_tokens=max_tokens),
             state)
     STATS.record(response.usage, time.monotonic() - started)   # P0：入账
@@ -1073,7 +1307,9 @@ def agent_loop(messages: list):
 
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
-        messages.append({"role": "assistant", "content": response.content})
+        # O2：正常收尾的轮次剥掉 thinking 块再进历史（推理块占上下文大头）。
+        # 续写路径（上面 max_tokens 分支）保留 thinking，供签名校验续接。
+        messages.append({"role": "assistant", "content": strip_thinking(response.content)})
         save_session(messages)   # 增量落盘：手动终止最多丢进行中的半轮
 
         # 没有 tool_use → 本轮结束
@@ -1122,6 +1358,10 @@ def agent_loop(messages: list):
             print(str(output)[-300:])
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": output})
+            # O1：超大 tool_use input（write_file 的 content / edit_file 的
+            # new_text / bash 的大 heredoc）同样落盘，历史里只留占位 + 路径。
+            # 执行已用原始 input 完成，改的是历史里的副本，不影响结果。
+            _shrink_large_input(block)
 
         if compacted_now:
             continue
@@ -1288,9 +1528,11 @@ def run_turn(history: list, query: str) -> None:
 
 if __name__ == "__main__":
     # 先做记忆自检（迁移旧格式 + 重建索引），再连 MCP（子进程 + 握手 + tools/list），
+    # 再探测 prompt cache（探针需要 TOOLS/工具池就位后的端点真实能力），
     # 再处理会话恢复（-c/-r/--list），最后打印 banner——banner 里的数目才是准的
     init_memory()
     assemble_tool_pool()
+    probe_prompt_cache()
     # 会话恢复钩子：-c/-r//resume 时从历史重建 todos，/new 时清空
     set_restore_hook(restore_todos_from_history)
     history = session_entry()       # 无参数时返回 []，即新会话
