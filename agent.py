@@ -34,7 +34,9 @@ import os
 import platform
 import random
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -217,6 +219,18 @@ PERSIST_PREVIEW = 500          # 落盘后的预览长度：头 500 + 尾 500
 SUMMARY_MAX_TOKENS = 2000      # 压缩摘要预算（关 thinking 后实测只用 ~262）
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 PROMPT = "\033[36mmyagent >> \033[0m"
+
+# 并行执行（A1+A2）：模型一条响应里发多个 tool_use 时，**无副作用**的工具并发
+# 执行，bash/写类仍串行。A1 = 只读工具（read_file/glob/grep）；A2 = 子代理
+# （task，各持独立 messages，天然可并行）——两者共享同一个线程池。并发打印
+# [并行] N 个，结果按 model 发来的顺序合并成一条 user 消息回灌。
+PARALLEL_READ_TOOLS = {"read_file", "glob", "grep"}
+PARALLEL_SUBAGENT_TOOLS = {"task"}
+PARALLEL_TOOLS = PARALLEL_READ_TOOLS | PARALLEL_SUBAGENT_TOOLS
+PARALLEL_MAX_WORKERS = 8
+# 权限确认（危险命令/工作区外写）要问用户 input()，子代理并发时可能同时触发。
+# 一个锁把它们串行化：确认期间其他线程不会读到提示符和回答交错。
+_PERMISSION_LOCK = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -608,14 +622,18 @@ def permission_hook(block):
 
     全权模式（AUTONOMOUS_MODE=1）跳过「确认类」拦截（危险命令确认、工作区外
     写审核），但 DENY_LIST 硬底线无条件保留。
+
+    两处「确认类」拦截都要 input() 问用户。子代理并发时多个线程可能同时走到
+    这里——用一个锁把确认串行化，避免提示符与回答互相撕扯（纯拦截逻辑本身
+    无共享状态，锁只包住 input 这一小段）。
     """
     if block.name == "bash":
         command = block.input.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 return f"Permission denied: '{pattern}' is on the deny list"
-        if not AUTONOMOUS_MODE:
-            if any(token in command for token in DESTRUCTIVE):
+        if not AUTONOMOUS_MODE and any(t in command for t in DESTRUCTIVE):
+            with _PERMISSION_LOCK:
                 print(f"\n\033[33m[permission] 潜在危险命令:\033[0m\n  {command}")
                 if input("  允许执行? [y/N] ").strip().lower() not in ("y", "yes"):
                     return "Permission denied by user"
@@ -627,9 +645,10 @@ def permission_hook(block):
             return f"Permission denied: invalid path {raw!r}: {e}"
         # 工作区内直接放行；工作区外的写/改需要用户当场审核
         if not is_inside_workspace(target):
-            if not confirm_out_of_workspace_write(block.name, target, block.input):
-                return ("Permission denied by user: refused to modify "
-                        f"out-of-workspace file {target}")
+            with _PERMISSION_LOCK:
+                if not confirm_out_of_workspace_write(block.name, target, block.input):
+                    return ("Permission denied by user: refused to modify "
+                            f"out-of-workspace file {target}")
     return None
 
 
@@ -652,7 +671,11 @@ register_hook("Stop", on_turn_end)
 # ═══════════════════════════════════════════════════════════════════════════
 SUB_SYSTEM = (f"You are a coding subagent at {WORKDIR}. "
               "Complete the task, then return a concise final summary. "
-              "Do not spawn more agents.")
+              "Do not spawn more agents. "
+              "Parallel subagents share this working directory but have NO file "
+              "locking: if you must modify a shared workspace file, do not race — "
+              "write to a distinct path instead, or report back what to change "
+              "and let the main agent apply it serially.")
 SUB_TOOL_NAMES = ("bash", "read_file", "write_file", "edit_file", "glob", "grep")
 
 
@@ -884,32 +907,34 @@ def _shrink_large_input(block) -> None:
 
 
 _persist_serial = 0   # 同一秒内多次落盘的同名文件加序号，避免互相覆盖
+_persist_lock = threading.Lock()   # 并发落盘（并行只读/子代理）时保护序号与写文件
 
 
 def _write_persisted(output: str, name: str) -> Path:
     """落盘 + 目录治理（清临时文件、限 40 个删最旧），返回写入的路径。"""
     global _persist_serial
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    # 同目录里 .tmp 开头的临时文件也会被 glob 扫到，先清掉旧的
-    for stale in TOOL_RESULTS_DIR.glob(".tmp-*"):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
-    results = sorted(TOOL_RESULTS_DIR.glob("*.txt"),
-                     key=lambda p: p.stat().st_mtime)
-    if len(results) >= 40:
-        for old in results[:len(results) - 40 + 1]:
+    with _persist_lock:
+        # 同目录里 .tmp 开头的临时文件也会被 glob 扫到，先清掉旧的
+        for stale in TOOL_RESULTS_DIR.glob(".tmp-*"):
             try:
-                old.unlink()
+                stale.unlink()
             except OSError:
                 pass
-    _persist_serial += 1
-    path = TOOL_RESULTS_DIR / f"{name}-{int(time.time())}-{_persist_serial}.txt"
-    # 先写临时文件再 os.replace：写一半崩了不留半个文件
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(output, encoding="utf-8")
-    os.replace(tmp, path)
+        results = sorted(TOOL_RESULTS_DIR.glob("*.txt"),
+                         key=lambda p: p.stat().st_mtime)
+        if len(results) >= 40:
+            for old in results[:len(results) - 40 + 1]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        _persist_serial += 1
+        path = TOOL_RESULTS_DIR / f"{name}-{int(time.time())}-{_persist_serial}.txt"
+        # 先写临时文件再 os.replace：写一半崩了不留半个文件
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(output, encoding="utf-8")
+        os.replace(tmp, path)
     return path
 
 
@@ -1140,7 +1165,11 @@ BUILTIN_TOOLS = [
                           "required": ["content", "status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
-     "description": "Launch a focused subagent for a subtask. Returns only its summary.",
+     "description": "Launch a focused subagent for a subtask. Returns only its "
+                    "summary. Independent subtasks run in parallel: you may "
+                    "issue several task calls in the SAME response to investigate "
+                    "separate directions at once — all results come back "
+                    "together.",
      "input_schema": {"type": "object",
                       "properties": {"description": {"type": "string"}},
                       "required": ["description"]}},
@@ -1321,9 +1350,38 @@ def agent_loop(messages: list):
         results = []
         compacted_now = False
         yield_requested = False
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        # 一次收集本响应里所有 tool_use 块
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+
+        # 无副作用工具批量并行执行（A1+A2）：read_file/glob/grep（只读）和
+        # task（子代理，各持独立 messages）可并发。其余工具（bash/写类/后台
+        # 派发）仍走下面的串行循环——bash 共享 cwd 并发会互相干扰，写类同理；
+        # 后台派发/yields_turn/compact 语义也依赖串行。
+        parallel = [b for b in tool_blocks if b.name in PARALLEL_TOOLS]
+        if parallel:
+            print(f"\033[90m[并行] 并发执行 {len(parallel)} 个工具\033[0m")
+            def _run_parallel(block):
+                print(f"\033[36m> {block.name}\033[0m")
+                blocked = trigger_hooks("PreToolUse", block)
+                if blocked:
+                    return {"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(blocked)}
+                try:
+                    output = call_tool_handler(HANDLERS.get(block.name),
+                                               block.input, block.name)
+                except Exception as e:
+                    # 单条并行工具（如子代理）崩了不许拖垮整批：兜底成错误
+                    # tool_result，其余任务照常完成、结果仍按顺序合并。
+                    output = (f"Error: {type(e).__name__}: {e}")
+                return {"type": "tool_result", "tool_use_id": block.id,
+                        "content": output}
+            with ThreadPoolExecutor(max_workers=PARALLEL_MAX_WORKERS) as pool:
+                for result in pool.map(_run_parallel, parallel):
+                    results.append(result)
+
+        for block in tool_blocks:
+            if block.name in PARALLEL_TOOLS:
+                continue   # 已并行执行
             print(f"\033[36m> {block.name}\033[0m")
 
             if block.name == "compact":
