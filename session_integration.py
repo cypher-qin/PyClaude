@@ -379,7 +379,7 @@ def handle_slash(cmd: str, history: list) -> bool:
     name, rest = name.lower(), rest.strip()
 
     if name == "/name":
-        print("T10 是历史上Cy-27原型机的名字。而T10则是我着手开发的第一个Agent \n")
+        print("T10D version0814\n")
         return True
 
     if name not in ("/resume", "/new", "/sessions"):
