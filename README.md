@@ -1,4 +1,4 @@
-# T10 — 个人编码 Agent
+# PyClaude — 个人编码 Agent
 
 单进程、交互式 REPL 的**个人编码 Agent**。启动后进入命令行，输入自然语言任务，Agent 自己调用工具、完成多步工作。接任意 **Anthropic 兼容**的模型网关（Kimi / DeepSeek / GLM / 官方 Claude…），换厂商只改 `.env`，一行代码不动。
 
